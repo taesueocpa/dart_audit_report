@@ -13,3 +13,10 @@ dashboard/out/
 *.sqlite3
 .DS_Store
 Thumbs.db
+
+# Claude Code worktree metadata
+.claude/
+
+# OpenDartReader corpCode 자동 캐시
+docs_cache/
+ingest/docs_cache/
