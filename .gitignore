@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+data/
+ingest/data/
+ingest/.venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+dashboard/node_modules/
+dashboard/.next/
+dashboard/out/
+*.sqlite3
+.DS_Store
+Thumbs.db
