@@ -26,17 +26,29 @@ from opendartreader import OpenDartReader
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\s+")
+# 단락/표/목록 시작·종료를 줄바꿈으로 변환할 블록 태그.
+_BLOCK_TAG_RE = re.compile(
+    r"<\s*/?\s*(?:p|br|div|tr|li|h[1-6]|table|thead|tbody)\b[^>]*>", re.IGNORECASE
+)
+_INLINE_WS_RE = re.compile(r"[ \t\r\f\v]+")
 _USER_AGENT = "Mozilla/5.0"
 _LIST_URL = "https://opendart.fss.or.kr/api/list.json"
 
 
 def html_to_text(raw: str) -> str:
-    """OPENDART 응답의 XML/HTML 태그를 제거해 평문 1줄로 정규화."""
+    """OPENDART 응답의 XML/HTML 태그를 제거해 평문으로 정규화 (줄바꿈 보존).
+
+    블록 태그(<p>, <br>, <div>, <tr>, <li>, <h*>, <table>)는 줄바꿈으로 치환하고,
+    나머지 인라인 태그는 공백으로 치환. HTML entity 디코드 후 줄별로
+    공백 정리 + 빈 줄 제거.
+    """
     if not raw:
         return ""
-    s = _TAG_RE.sub(" ", raw)
+    s = _BLOCK_TAG_RE.sub("\n", raw)
+    s = _TAG_RE.sub(" ", s)
     s = html.unescape(s)
-    return _WS_RE.sub(" ", s).strip()
+    lines = (_INLINE_WS_RE.sub(" ", line).strip() for line in s.split("\n"))
+    return "\n".join(line for line in lines if line)
 
 
 # --- 1) 회계감사 구조화 4필드 (당기 행) ---------------------------------------------

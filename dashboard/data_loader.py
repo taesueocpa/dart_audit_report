@@ -8,7 +8,7 @@ import streamlit as st
 
 
 # 파일 위치: dashboard/data_loader.py 기준 상대.
-_DEFAULT_XLSX = Path(__file__).resolve().parent / "data" / "audit_reports_full_v2.xlsx"
+_DEFAULT_XLSX = Path(__file__).resolve().parent / "data" / "audit_reports_full_v3.xlsx"
 
 # 표시 시 ".0" suffix 방지를 위해 강제로 str 처리할 컬럼.
 _STR_COLS: tuple[str, ...] = (
@@ -18,9 +18,11 @@ _STR_COLS: tuple[str, ...] = (
     "사업보고서 접수번호",
 )
 
-# 본문 컬럼 (필터/검색 시 텍스트 대상).
+# 본문 컬럼 (필터/검색 시 텍스트 대상 + 행 클릭 시 expander 로 표시).
+# '핵심감사사항(본문)' 은 raw HTML 본문에서 직접 추출한 KAM 전체 문단 (97.8% 보유).
+# '핵심감사사항(KAM)' (OPENDART API) 는 데이터에는 남아 있지만 표시는 본문 우선.
 TEXT_COLS: tuple[str, ...] = (
-    "핵심감사사항(KAM)",
+    "핵심감사사항(본문)",
     "강조사항",
     "기타사항",
     "감사보고서 본문 전체",

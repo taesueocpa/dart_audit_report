@@ -22,6 +22,7 @@ except ImportError:  # pragma: no cover
 
 from audit_xlsx.extractors import (
     extract_cpa_partner,
+    extract_kam_full_block,
     extract_other_matters,
     extract_standalone_audit_report_body,
 )
@@ -120,6 +121,9 @@ def _build_row(
     body = extract_standalone_audit_report_body(flat_text)
     cpa = extract_cpa_partner(body or flat_text)
     other = extract_other_matters(body or flat_text)
+    # KAM: 본문에서 추출한 전체 문단 우선, 없으면 OPENDART API 의 core_adt_matter.
+    kam_body = extract_kam_full_block(body or flat_text)
+    kam_final = kam_body if kam_body else op.core_adt_matter
     return {
         "stock_code": stock.get("stock_code", ""),
         "corp_code": op.corp_code or stock.get("corp_code", ""),
@@ -133,7 +137,7 @@ def _build_row(
         "bsns_year": op.bsns_year,
         "adt_opinion": op.adt_opinion,
         "adtor": op.adtor,
-        "core_adt_matter": op.core_adt_matter,
+        "core_adt_matter": kam_final,
         "emphs_matter": op.emphs_matter,
         "cpa_partner_name": cpa or "",
         "other_matters": other or "",

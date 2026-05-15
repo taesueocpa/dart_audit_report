@@ -29,8 +29,17 @@ _MAX_AUDIT_REPORT_BODY = 2_000_000
 _MIN_AUDIT_REPORT_BODY = 40
 
 
+def _normalize_block_keep_newlines(block: str) -> str:
+    """줄별로 공백 정리 + 빈 줄 제거. 줄바꿈은 보존."""
+    lines = (re.sub(r"[ \t\r\f\v]+", " ", line).strip() for line in block.split("\n"))
+    return "\n".join(line for line in lines if line)
+
+
 def extract_standalone_audit_report_body(text: str) -> str | None:
-    """'독립된 감사인의 감사보고서 [회사명] 주주 및 이사회 귀중' ~ 결구 또는 첨부 직전."""
+    """'독립된 감사인의 감사보고서 [회사명] 주주 및 이사회 귀중' ~ 결구 또는 첨부 직전.
+
+    줄바꿈은 보존 (가독성). 줄 안의 공백만 단일화.
+    """
     head = _AUDIT_REPORT_HEAD.search(text)
     if head is None:
         return None
@@ -47,10 +56,45 @@ def extract_standalone_audit_report_body(text: str) -> str | None:
     else:
         end_pos = len(window)
 
-    block = _WS.sub(" ", window[:end_pos]).strip()
+    block = _normalize_block_keep_newlines(window[:end_pos])
     if len(block) < _MIN_AUDIT_REPORT_BODY:
         return None
     return block
+
+
+# --- 핵심감사사항 (KAM) 본문 추출 -------------------------------------------------
+# "핵심감사사항" 헤더 ~ 다음 표준 절 (기타사항/책임 단락) 직전.
+_KAM_HEADER = re.compile(
+    r"(?<![가-힣])(?:핵심\s*감사\s*사항|Key\s*Audit\s*Matters)(?![가-힣]|들)", re.I
+)
+_KAM_END_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?<![가-힣])기\s*타\s*사\s*항(?![가-힣])(?!\s*(?:외|을|은|는|이|가|에|에서|의|들))"),
+    re.compile(r"(?:연결)?재무제표에\s*대한\s*경영(?:자|진)과?\s*(?:및\s*)?지배기구의\s*책임"),
+    re.compile(r"(?:연결)?재무제표\s*감사에\s*대한\s*감사인의\s*책임"),
+    re.compile(r"독립된\s*감사인의\s*책임"),
+)
+_KAM_OUT_LIMIT = 200_000
+_KAM_MIN_LEN = 30
+
+
+def extract_kam_full_block(text: str) -> str | None:
+    """본문에서 '핵심감사사항' 헤더부터 다음 표준 섹션 직전까지 전체 문단.
+
+    KAM 항목별 분리 없이 헤더~다음 절 직전까지를 한 덩어리로 반환. 줄바꿈 보존.
+    """
+    m = _KAM_HEADER.search(text)
+    if m is None:
+        return None
+    start = m.start()
+    end = len(text)
+    for pat in _KAM_END_PATTERNS:
+        em = pat.search(text, pos=m.end())
+        if em:
+            end = min(end, em.start())
+    block = _normalize_block_keep_newlines(text[start:end])
+    if len(block) < _KAM_MIN_LEN:
+        return None
+    return block[:_KAM_OUT_LIMIT]
 
 
 # --- 감사의견 라벨 -------------------------------------------------------------
