@@ -20,3 +20,7 @@ Thumbs.db
 # OpenDartReader corpCode 자동 캐시
 docs_cache/
 ingest/docs_cache/
+
+# 대시보드 데이터 (XLSX)는 git tracking — Streamlit Cloud 배포용
+!dashboard/data/
+!dashboard/data/*.xlsx
