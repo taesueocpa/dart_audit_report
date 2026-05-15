@@ -94,6 +94,8 @@ def main() -> int:
     matched = 0
     no_parent = 0
     no_match = 0
+    kam_from_body = 0
+    kam_from_api = 0
 
     for i, row in df.iterrows():
         parent = str(row.get("감사보고서제출 접수번호") or "").strip()
@@ -102,7 +104,7 @@ def main() -> int:
 
         if not parent or parent not in raw_index:
             no_parent += 1
-            new_kam.append("")
+            new_kam.append(old_kam_api)  # API fallback
             new_body.append(old_body)
             continue
 
@@ -110,7 +112,6 @@ def main() -> int:
         old_norm = normalize_for_match(old_body)[:200]
         matched_raw: str | None = None
         if not old_norm:
-            # 본문이 없는 행 — 그냥 첫 후보 사용 (rare)
             matched_raw = candidates[0][1] if candidates else None
         else:
             for _dcm, raw in candidates:
@@ -121,7 +122,7 @@ def main() -> int:
 
         if matched_raw is None:
             no_match += 1
-            new_kam.append("")
+            new_kam.append(old_kam_api)  # API fallback
             new_body.append(old_body)
             continue
 
@@ -130,17 +131,29 @@ def main() -> int:
         body_new = extract_standalone_audit_report_body(flat_new)
         kam_full = extract_kam_full_block(body_new or flat_new)
 
+        # KAM 우선순위: 본문 추출 > API > 빈값
+        if kam_full:
+            kam_value = kam_full
+            kam_from_body += 1
+        elif old_kam_api:
+            kam_value = old_kam_api
+            kam_from_api += 1
+        else:
+            kam_value = ""
+
         new_body.append(body_new or old_body)
-        new_kam.append(kam_full or "")
+        new_kam.append(kam_value)
 
         if (i + 1) % 500 == 0:
             print(
-                f"  [{i+1}/{len(df)}] matched={matched} no_parent={no_parent} no_match={no_match}",
+                f"  [{i+1}/{len(df)}] matched={matched} no_parent={no_parent} "
+                f"no_match={no_match} kam(body)={kam_from_body} kam(api)={kam_from_api}",
                 flush=True,
             )
 
     print(
-        f"\n총 {len(df)} | matched {matched} | no_parent {no_parent} | no_match {no_match}",
+        f"\n총 {len(df)} | matched {matched} | no_parent {no_parent} | no_match {no_match}\n"
+        f"KAM source: 본문 {kam_from_body} + API {kam_from_api} = {kam_from_body + kam_from_api} / {len(df)}",
         flush=True,
     )
 

@@ -67,7 +67,10 @@ def extract_standalone_audit_report_body(text: str) -> str | None:
 _KAM_HEADER = re.compile(
     r"(?<![가-힣])(?:핵심\s*감사\s*사항|Key\s*Audit\s*Matters)(?![가-힣]|들)", re.I
 )
+# 표준 감사보고서 절 순서: 감사의견 → 감사의견근거 → KAM → [강조사항] → [기타사항]
+# → 경영진 책임 → 감사인 책임. KAM 다음 절 후보는 강조사항/기타사항/책임 단락.
 _KAM_END_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?<![가-힣])강\s*조\s*사\s*항(?![가-힣])(?!\s*(?:외|을|은|는|이|가|에|에서|의|들))"),
     re.compile(r"(?<![가-힣])기\s*타\s*사\s*항(?![가-힣])(?!\s*(?:외|을|은|는|이|가|에|에서|의|들))"),
     re.compile(r"(?:연결)?재무제표에\s*대한\s*경영(?:자|진)과?\s*(?:및\s*)?지배기구의\s*책임"),
     re.compile(r"(?:연결)?재무제표\s*감사에\s*대한\s*감사인의\s*책임"),
