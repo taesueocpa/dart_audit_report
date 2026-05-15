@@ -1,14 +1,24 @@
 """매핑 행 → (구조화 API + 감사보고서제출 첨부 본문) → XLSX 행 리스트.
 
 각 회사마다 0건~N건의 행이 나올 수 있다 (F001 + F002 둘 다 제출하면 2행).
+
+성능:
+- OPENDART API 호출 사이 sleep ``_REQUEST_SLEEP`` 적용 (회사당 2~3회).
+- viewer.do 본문 fetch 는 ``_VIEWER_WORKERS`` 개의 ThreadPoolExecutor 로 병렬화.
 """
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Iterable
 
 from opendartreader import OpenDartReader
+
+try:
+    from tqdm import tqdm  # type: ignore[import-untyped]
+except ImportError:  # pragma: no cover
+    tqdm = None  # type: ignore[assignment]
 
 from audit_xlsx.extractors import (
     extract_cpa_partner,
@@ -27,16 +37,12 @@ from audit_xlsx.fetch_audit import (
 from audit_xlsx.settings import Settings
 
 
-_REQUEST_SLEEP = 0.12  # OPENDART API 호출 사이
-_FETCH_SLEEP = 0.05  # dart.fss.or.kr (viewer) 호출 사이
+_REQUEST_SLEEP = 0.06  # OPENDART API (report + list) 호출 사이
+_VIEWER_WORKERS = 4    # main.do/viewer.do GET 병렬도
 
 
 def _dedupe_amended(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """같은 (corp_code, report_kind) 그룹에서 정정본 우선 + 최신 1건만.
-
-    - 첨부 제목에 "정정" 키워드가 있으면 정정본 → 우선 채택.
-    - 같은 등급(정정/원본) 내에선 parent_rcept_no 가 큰 것 (시간순 후순위 = 최신).
-    """
+    """같은 (corp_code, report_kind) 그룹에서 정정본 우선 + 최신 1건만."""
     from collections import defaultdict
 
     groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
@@ -83,28 +89,33 @@ def _meta_row(stock: dict[str, str], op: AuditOpinion | None, *, skip_reason: st
     }
 
 
-def _process_attachment(
+# 5KB 이하 캐시는 표지/목차만 받은 케이스로 간주하고 무시 — 새 multi-page fetch 로 재시도.
+_MIN_USABLE_CACHE_BYTES = 5_000
+
+
+def _fetch_attachment_text(
+    parent_rcept_no: str, att: Attachment, save_raw_dir: Path | None
+) -> str:
+    """디스크 캐시 우선, 너무 짧은 캐시는 무시하고 viewer fetch 재시도."""
+    cache: Path | None = None
+    if save_raw_dir is not None:
+        cache = save_raw_dir / f"{parent_rcept_no}_{att.dcm_no}.html"
+    if cache is not None and cache.exists() and cache.stat().st_size >= _MIN_USABLE_CACHE_BYTES:
+        return cache.read_text(encoding="utf-8")
+    raw_text = fetch_attachment_body(att.main_url)
+    if cache is not None and raw_text:
+        cache.write_text(raw_text, encoding="utf-8")
+    return raw_text
+
+
+def _build_row(
     op: AuditOpinion,
     stock: dict[str, str],
     parent_rcept_no: str,
     att: Attachment,
-    *,
-    save_raw_dir: Path | None,
+    raw_text: str,
 ) -> dict[str, Any]:
-    """첨부 1건 → 본문 다운/슬라이스 → XLSX 행 dict."""
-    cache: Path | None = None
-    if save_raw_dir is not None:
-        save_raw_dir.mkdir(parents=True, exist_ok=True)
-        cache = save_raw_dir / f"{parent_rcept_no}_{att.dcm_no}.html"
-
-    if cache is not None and cache.exists() and cache.stat().st_size > 0:
-        raw_text = cache.read_text(encoding="utf-8")
-    else:
-        raw_text = fetch_attachment_body(att.main_url)
-        if cache is not None and raw_text:
-            cache.write_text(raw_text, encoding="utf-8")
-        time.sleep(_FETCH_SLEEP)
-
+    """raw 본문 → 슬라이스/CPA/other 추출 → row dict."""
     flat_text = html_to_text(raw_text)
     body = extract_standalone_audit_report_body(flat_text)
     cpa = extract_cpa_partner(body or flat_text)
@@ -146,6 +157,7 @@ def parse_one(
     end: str = "2026-04-30",
     fetch_body: bool = True,
     save_raw_dir: Path | None = None,
+    pool: ThreadPoolExecutor | None = None,
 ) -> list[dict[str, Any]]:
     """매핑 1행 → XLSX 행 리스트 (회사당 N개)."""
     op = fetch_audit_opinion(
@@ -157,39 +169,48 @@ def parse_one(
     if not fetch_body:
         return [_meta_row(stock, op, skip_reason="no_body_requested")]
 
-    # 1) 감사보고서제출 공시 목록
+    # 1) 감사보고서제출 공시 + 첨부 메타 수집 (직렬, 가벼운 OPENDART/attach_docs API)
     disclosures = list_audit_disclosures(
         settings.api_key, corp_code=stock["corp_code"], start=start, end=end
     )
-
-    rows: list[dict[str, Any]] = []
-    seen_dcm: set[tuple[str, str]] = set()  # (parent_rcept, dcm_no) 중복 방지
-
+    pending: list[tuple[str, Attachment]] = []
+    seen: set[tuple[str, str]] = set()
     for d in disclosures:
-        atts = list_audit_attachments(dart, d.rcept_no)
-        for att in atts:
+        for att in list_audit_attachments(dart, d.rcept_no):
             key = (att.parent_rcept_no, att.dcm_no)
-            if key in seen_dcm:
+            if key in seen:
                 continue
-            seen_dcm.add(key)
-            rows.append(
-                _process_attachment(op, stock, d.rcept_no, att, save_raw_dir=save_raw_dir)
-            )
+            seen.add(key)
+            pending.append((d.rcept_no, att))
 
-    # 2) Fallback — 감사보고서제출 공시가 없거나 첨부가 안 잡힌 경우 사업보고서 첨부.
-    if not rows and op.rcept_no:
-        atts = list_audit_attachments(dart, op.rcept_no)
-        for att in atts:
+    # Fallback: 감사보고서제출 공시가 없거나 첨부가 없으면 사업보고서 첨부.
+    if not pending and op.rcept_no:
+        for att in list_audit_attachments(dart, op.rcept_no):
             key = (att.parent_rcept_no, att.dcm_no)
-            if key in seen_dcm:
+            if key in seen:
                 continue
-            seen_dcm.add(key)
-            rows.append(
-                _process_attachment(op, stock, op.rcept_no, att, save_raw_dir=save_raw_dir)
-            )
+            seen.add(key)
+            pending.append((op.rcept_no, att))
 
-    if not rows:
+    if not pending:
         return [_meta_row(stock, op, skip_reason="no_attachments")]
+
+    if save_raw_dir is not None:
+        save_raw_dir.mkdir(parents=True, exist_ok=True)
+
+    # 2) viewer fetch 병렬 (worker pool 재사용)
+    raw_texts: list[str]
+    if pool is not None:
+        raw_texts = list(
+            pool.map(
+                lambda x: _fetch_attachment_text(x[0], x[1], save_raw_dir), pending
+            )
+        )
+    else:
+        raw_texts = [_fetch_attachment_text(p, a, save_raw_dir) for p, a in pending]
+
+    # 3) CPU-bound 추출 (직렬)
+    rows = [_build_row(op, stock, parent, att, raw) for (parent, att), raw in zip(pending, raw_texts)]
     return _dedupe_amended(rows)
 
 
@@ -210,32 +231,69 @@ def parse_many(
     save_dir = settings.raw_dir if save_raw else None
     items = list(stocks)
     all_rows: list[dict[str, Any]] = []
-    for i, stock in enumerate(items, 1):
-        try:
-            rows = parse_one(
-                dart,
-                settings,
-                stock,
-                bsns_year=bsns_year,
-                reprt_code=reprt_code,
-                start=start,
-                end=end,
-                fetch_body=fetch_body,
-                save_raw_dir=save_dir,
-            )
-        except Exception as e:  # noqa: BLE001
-            r = _meta_row(stock, None, skip_reason="exception")
-            r["parse_error"] = str(e)
-            rows = [r]
-        all_rows.extend(rows)
-        if progress:
-            kinds = "/".join(sorted({r.get("report_kind") or "—" for r in rows}))
-            body_lens = ",".join(str(r.get("audit_report_body_length") or 0) for r in rows)
-            print(
-                f"[{i:>3}/{len(items)}] {stock.get('corp_name',''):<14} "
-                f"({stock.get('stock_code','')}) · 행수={len(rows)} · "
-                f"종류={kinds} · 본문={body_lens}자",
-                flush=True,
-            )
-        time.sleep(_REQUEST_SLEEP)
+
+    use_bar = progress and tqdm is not None
+    iterator = (
+        tqdm(items, desc="회사", unit="개", dynamic_ncols=True, mininterval=0.5)
+        if use_bar
+        else items
+    )
+
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=_VIEWER_WORKERS) as pool:
+        for i, stock in enumerate(iterator, 1):
+            try:
+                rows = parse_one(
+                    dart,
+                    settings,
+                    stock,
+                    bsns_year=bsns_year,
+                    reprt_code=reprt_code,
+                    start=start,
+                    end=end,
+                    fetch_body=fetch_body,
+                    save_raw_dir=save_dir,
+                    pool=pool,
+                )
+            except Exception as e:  # noqa: BLE001
+                r = _meta_row(stock, None, skip_reason="exception")
+                r["parse_error"] = str(e)
+                rows = [r]
+            all_rows.extend(rows)
+
+            if use_bar:
+                kinds = "+".join(sorted({(r.get("report_kind") or "—") for r in rows}))
+                iterator.set_postfix_str(  # type: ignore[union-attr]
+                    f"{stock.get('corp_name','')[:8]} ×{len(rows)} {kinds} acc={len(all_rows)}",
+                    refresh=False,
+                )
+            elif progress:
+                kinds = "/".join(sorted({r.get("report_kind") or "—" for r in rows}))
+                body_lens = ",".join(str(r.get("audit_report_body_length") or 0) for r in rows)
+                print(
+                    f"[{i:>4}/{len(items)}] {stock.get('corp_name',''):<14} "
+                    f"({stock.get('stock_code','')}) · 행수={len(rows)} · "
+                    f"종류={kinds} · 본문={body_lens}자",
+                    flush=True,
+                )
+            # 매 50건마다 별도 한 줄로 진행 마일스톤 출력 (모니터 친화적, 줄 단위)
+            if progress and i % 50 == 0:
+                el = time.time() - t0
+                rate = el / i
+                remaining = rate * (len(items) - i)
+                print(
+                    f"[milestone] {i}/{len(items)} ({100*i/len(items):.1f}%) · "
+                    f"acc {len(all_rows)} rows · {rate:.2f}s/co · "
+                    f"elapsed {el/60:.1f}min · ETA {remaining/60:.1f}min",
+                    flush=True,
+                )
+            time.sleep(_REQUEST_SLEEP)
+
+    elapsed = time.time() - t0
+    if progress:
+        print(
+            f"\n[parse_many] elapsed {elapsed:.1f}s ({elapsed/max(len(items),1):.2f}s/회사) · "
+            f"총 {len(all_rows)}행",
+            flush=True,
+        )
     return all_rows

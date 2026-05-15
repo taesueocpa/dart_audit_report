@@ -54,6 +54,43 @@ class AuditOpinion:
     core_adt_matter: str  # 핵심감사사항
 
 
+_FIRM_HANGUL_GAP_RE = re.compile(r"([가-힣])\s+([가-힣])")
+_FIRM_PARENS_RE = re.compile(r"\s*\([^)]*\)")
+_FIRM_TAIL_RE = re.compile(r"^(.{1,30}?회계법인)")
+_FIRM_REVERSED_RE = re.compile(r"(회계법인[가-힣A-Za-z\s]{1,15})")
+
+
+def normalize_firm_name(s: str) -> str:
+    """감사인 표기 정규화: 줄바꿈/공백/괄호 부가설명 제거 + 한글 사이 공백 합침.
+
+    예: '삼정\\n회계법인' → '삼정회계법인'
+        '삼일 회계법인' → '삼일회계법인'
+        '대성회계법인\\n(구, 대성삼경회계법인)' → '대성회계법인'
+        '한미회계법인\\n대표이사 정우진' → '한미회계법인'
+        '회계법인 리안' → '회계법인리안'
+    """
+    if not s:
+        return ""
+    s = _WS_RE.sub(" ", s).strip()
+    # 1) 괄호 안 부가설명 제거 — (구, …) (前 …) (PwC) (주1) 등
+    s = _FIRM_PARENS_RE.sub("", s).strip()
+    # 2) "...회계법인" 첫 매치만 채택 (뒤의 대표이사/주석 등 절단)
+    m = _FIRM_TAIL_RE.search(s)
+    if m:
+        s = m.group(1)
+    elif "회계법인" in s:
+        m = _FIRM_REVERSED_RE.search(s)
+        if m:
+            s = m.group(1)
+    # 3) 한글 글자 사이 단일 공백 제거 (반복)
+    while True:
+        new = _FIRM_HANGUL_GAP_RE.sub(r"\1\2", s)
+        if new == s:
+            break
+        s = new
+    return s.strip()
+
+
 def _row_to_opinion(row: dict[str, Any]) -> AuditOpinion:
     def _s(v: Any) -> str:
         if v is None:
@@ -67,7 +104,7 @@ def _row_to_opinion(row: dict[str, Any]) -> AuditOpinion:
         corp_cls=_s(row.get("corp_cls")),
         bsns_year=_s(row.get("bsns_year")),
         stlm_dt=_s(row.get("stlm_dt")),
-        adtor=_s(row.get("adtor")),
+        adtor=normalize_firm_name(_s(row.get("adtor"))),
         adt_opinion=_s(row.get("adt_opinion")),
         emphs_matter=_s(row.get("emphs_matter")),
         core_adt_matter=_s(row.get("core_adt_matter")),
@@ -184,6 +221,19 @@ _ATTACH_RCPNO_RE = re.compile(r"rcpNo=(\d+)")
 _VIEWDOC_INIT_RE = re.compile(
     r'viewDoc\(\s*"(\d+)"\s*,\s*"(\d+)"\s*,\s*"(\d*)"\s*,\s*"(\d*)"\s*,\s*"(\d*)"\s*,\s*"([\w\.]+)"'
 )
+# main.do 페이지의 multi-page tree (첨부가 여러 sub 문서로 나뉜 경우)
+_MULTI_PAGE_RE = re.compile(
+    r"\s+node[12]?\['text'\][ =]+\"(.*?)\";"
+    r"\s+node[12]?\['id'\][ =]+\"(\d+)\";"
+    r"\s+node[12]?\['rcpNo'\][ =]+\"(\d+)\";"
+    r"\s+node[12]?\['dcmNo'\][ =]+\"(\d+)\";"
+    r"\s+node[12]?\['eleId'\][ =]+\"(\d+)\";"
+    r"\s+node[12]?\['offset'\][ =]+\"(\d+)\";"
+    r"\s+node[12]?\['length'\][ =]+\"(\d+)\";"
+    r"\s+node[12]?\['dtd'\][ =]+\"(.*?)\";"
+)
+# 첨부 제목에서 외부감사보고서가 *아닌* 것들을 거른다.
+_EXCLUDE_ATTACH_TITLE_RE = re.compile(r"감사위원회|감사의\s*감사")
 
 
 def list_audit_attachments(
@@ -202,6 +252,9 @@ def list_audit_attachments(
         url = str(row.get("url") or "").strip()
         if not title or not url or "감사보고서" not in title:
             continue
+        # 외부감사보고서가 아닌 첨부 제거: 감사위원회 감사보고서, 감사의 감사보고서.
+        if _EXCLUDE_ATTACH_TITLE_RE.search(title):
+            continue
         rcp_m = _ATTACH_RCPNO_RE.search(url)
         dcm_m = _ATTACH_DCMNO_RE.search(url)
         if not rcp_m or not dcm_m:
@@ -217,26 +270,44 @@ def list_audit_attachments(
     return out
 
 
-def fetch_attachment_body(main_url: str) -> str:
-    """첨부 main.do URL → viewer.do URL → raw HTML 본문.
-
-    main.do 페이지의 onload `viewDoc(...)` 인자에 박힌 (rcpNo,dcmNo,eleId,offset,length,dtd)
-    를 파싱해 viewer.do URL 을 구성하고 GET 한다.
-    """
-    try:
-        r1 = requests.get(main_url, headers={"User-Agent": _USER_AGENT}, timeout=30)
-    except requests.RequestException:
-        return ""
-    m = _VIEWDOC_INIT_RE.search(r1.text)
-    if not m:
-        return ""
-    rcp, dcm, ele, off, length, dtd = m.groups()
-    viewer = (
+def _viewer_url(rcp: str, dcm: str, ele: str, off: str, length: str, dtd: str) -> str:
+    return (
         f"http://dart.fss.or.kr/report/viewer.do?rcpNo={rcp}&dcmNo={dcm}"
         f"&eleId={ele}&offset={off}&length={length}&dtd={dtd}"
     )
+
+
+def _http_get(url: str, *, timeout: float = 60.0) -> str:
     try:
-        r2 = requests.get(viewer, headers={"User-Agent": _USER_AGENT}, timeout=60)
+        r = requests.get(url, headers={"User-Agent": _USER_AGENT}, timeout=timeout)
+        return r.text
     except requests.RequestException:
         return ""
-    return r2.text
+
+
+def fetch_attachment_body(main_url: str) -> str:
+    """첨부 main.do URL → viewer.do URL → raw HTML 본문.
+
+    1차: main.do 페이지에 multi-page tree (sub_docs) 가 있으면 모든 sub viewer 를
+    합쳐서 반환 (예: "표지 / 감사보고서 / 첨부재무제표 / 주석 / ...").
+    2차: tree 가 없는 단일 첨부면 onload viewDoc 인자로 viewer 한 개 GET.
+    """
+    main_html = _http_get(main_url, timeout=30)
+    if not main_html:
+        return ""
+
+    # 1차: multi-page tree
+    nodes = _MULTI_PAGE_RE.findall(main_html)
+    if nodes:
+        parts: list[str] = []
+        for _title, _id, rcp, dcm, ele, off, length, dtd in nodes:
+            parts.append(_http_get(_viewer_url(rcp, dcm, ele, off, length, dtd)))
+        joined = "\n\n".join(p for p in parts if p)
+        if joined:
+            return joined
+
+    # 2차: 단일 viewDoc
+    m = _VIEWDOC_INIT_RE.search(main_html)
+    if not m:
+        return ""
+    return _http_get(_viewer_url(*m.groups()))
