@@ -1,13 +1,19 @@
 # DART 감사보고서 대시보드 (Streamlit)
 
-`audit_xlsx` 파이프라인이 만든 4,627행 감사보고서 DB
-(`data/audit_reports_full_v2.xlsx`) 를 시각화/검색하는 Streamlit 앱.
+`audit_xlsx` 파이프라인이 만든 감사보고서 DB
+(`data/audit_reports_full_v2.xlsx`) 를 필터링·검색·조회하는 Streamlit 앱.
 
 ## 기능
 
-- 📈 **요약**: 감사의견·시장·회계법인 분포 차트, KPI 4개
-- 📋 **회사목록**: 검색·정렬·필터, 행 클릭 → 본문 드릴다운, Excel 다운로드
-- 🔎 **본문 검색**: KAM/강조사항/기타사항/본문 전체에서 키워드 매칭 + 컨텍스트 발췌
+단일 페이지 — 사이드바 필터 + 메인 표 + 행 클릭 시 본문 전체 조회.
+
+- **사이드바 필터**:
+  - 시장구분 / 감사의견 / 보고서 종류 / 감사인(회계법인) — 멀티셀렉트
+  - 회사명/종목코드 — 부분일치 텍스트
+  - **본문 키워드** — KAM·강조사항·기타사항·본문 전체 통합 검색
+- **메인 표**: 회사명·시장·의견·감사인·본문 길이 등. 컬럼 정렬·검색 빌트인
+- **본문 조회**: 표 행 클릭 → 메타 + KAM/강조/기타/본문 전체 expander
+- **Excel 다운로드**: 현재 필터 결과를 XLSX로 (본문 포함/제외 토글)
 
 ## 로컬 실행
 
@@ -36,12 +42,10 @@ streamlit run app.py
 
 ```
 dashboard/
-├── app.py             # entry — 사이드바 + 3개 탭
+├── app.py             # entry — 사이드바 + 메인 표 + 본문 expander
 ├── data_loader.py     # XLSX → DataFrame (캐싱)
-├── filters.py         # 사이드바 필터 위젯
-├── charts.py          # KPI + Plotly 차트 4종
+├── filters.py         # 사이드바 5종 필터 + 본문 키워드 통합 검색
 ├── download.py        # 필터 결과 → Excel bytes
-├── search.py          # 본문 키워드 검색 + highlight
 ├── data/
 │   └── audit_reports_full_v2.xlsx
 ├── requirements.txt

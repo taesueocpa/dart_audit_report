@@ -1,12 +1,16 @@
-"""사이드바 필터 위젯. 모든 탭이 공유하는 boolean mask 생성."""
+"""사이드바 필터 위젯 — 메타 필터 5종 + 본문 키워드 검색."""
 from __future__ import annotations
+
+import re
 
 import pandas as pd
 import streamlit as st
 
+from data_loader import TEXT_COLS
+
 
 def _opts(series: pd.Series) -> list[str]:
-    """multiselect 옵션 — 빈 값 제외 + 알파벳/가나다 정렬."""
+    """multiselect 옵션 — 빈 값 제외 + 정렬."""
     vals = (
         series.dropna()
         .astype(str)
@@ -41,7 +45,11 @@ def render_sidebar(df: pd.DataFrame) -> tuple[pd.Series, dict]:
     ).strip()
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("💡 본문 키워드 검색은 '본문 검색' 탭에서 사용")
+    body_kw = st.sidebar.text_input(
+        "본문 키워드 검색",
+        placeholder="예: 계속기업 불확실성",
+        help="KAM·강조사항·기타사항·감사보고서 본문 전체에서 부분 일치",
+    ).strip()
 
     mask = pd.Series(True, index=df.index)
     if market:
@@ -58,6 +66,13 @@ def render_sidebar(df: pd.DataFrame) -> tuple[pd.Series, dict]:
             df["회사명"].fillna("").str.lower().str.contains(ql)
             | df["종목코드"].fillna("").str.contains(name_q)
         )
+    if body_kw:
+        # KAM/강조/기타/본문 통합 검색 — 어느 한 컬럼이라도 매칭되면 채택
+        text_cols = [c for c in TEXT_COLS if c in df.columns]
+        body_mask = pd.Series(False, index=df.index)
+        for c in text_cols:
+            body_mask |= df[c].fillna("").str.contains(re.escape(body_kw), case=False, regex=True)
+        mask &= body_mask
 
     selected = {
         "market": market,
@@ -65,6 +80,7 @@ def render_sidebar(df: pd.DataFrame) -> tuple[pd.Series, dict]:
         "kind": kind,
         "firms": firms,
         "name_q": name_q,
+        "body_kw": body_kw,
     }
     st.sidebar.markdown(f"**필터 결과: {int(mask.sum()):,} / {len(df):,} 행**")
     return mask, selected
