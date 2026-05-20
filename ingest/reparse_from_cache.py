@@ -26,6 +26,7 @@ _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 
 from audit_xlsx.extractors import (  # noqa: E402
+    extract_audit_body_html,
     extract_kam_full_block,
     extract_standalone_audit_report_body,
 )
@@ -91,11 +92,15 @@ def main() -> int:
     # 3) 각 행 처리 — 매칭 → 새 컬럼 채움
     new_kam: list[str] = []
     new_body: list[str] = []
+    new_body_html: list[str] = []
     matched = 0
     no_parent = 0
     no_match = 0
     kam_from_body = 0
     kam_from_api = 0
+    html_extracted = 0
+    html_truncated = 0
+    _XLSX_CELL_LIMIT = 32_767
 
     for i, row in df.iterrows():
         parent = str(row.get("감사보고서제출 접수번호") or "").strip()
@@ -106,6 +111,7 @@ def main() -> int:
             no_parent += 1
             new_kam.append(old_kam_api)  # API fallback
             new_body.append(old_body)
+            new_body_html.append("")
             continue
 
         candidates = raw_index[parent]
@@ -124,12 +130,14 @@ def main() -> int:
             no_match += 1
             new_kam.append(old_kam_api)  # API fallback
             new_body.append(old_body)
+            new_body_html.append("")
             continue
 
         matched += 1
         flat_new = html_to_text(matched_raw)  # NEW: 줄바꿈 보존
         body_new = extract_standalone_audit_report_body(flat_new)
         kam_full = extract_kam_full_block(body_new or flat_new)
+        body_html = extract_audit_body_html(matched_raw)
 
         # KAM 우선순위: 본문 추출 > API > 빈값
         if kam_full:
@@ -141,27 +149,41 @@ def main() -> int:
         else:
             kam_value = ""
 
+        # HTML 본문 — XLSX 셀 한도 초과 시 truncate.
+        html_value = body_html or ""
+        if len(html_value) > _XLSX_CELL_LIMIT:
+            html_value = html_value[: _XLSX_CELL_LIMIT - 100] + (
+                "\n<!-- truncated at 32K limit; 전체 본문은 raw_audit/ 캐시 참조 -->"
+            )
+            html_truncated += 1
+        if body_html:
+            html_extracted += 1
+
         new_body.append(body_new or old_body)
         new_kam.append(kam_value)
+        new_body_html.append(html_value)
 
         if (i + 1) % 500 == 0:
             print(
                 f"  [{i+1}/{len(df)}] matched={matched} no_parent={no_parent} "
-                f"no_match={no_match} kam(body)={kam_from_body} kam(api)={kam_from_api}",
+                f"no_match={no_match} kam(body)={kam_from_body} kam(api)={kam_from_api} "
+                f"html={html_extracted} (truncated {html_truncated})",
                 flush=True,
             )
 
     print(
         f"\n총 {len(df)} | matched {matched} | no_parent {no_parent} | no_match {no_match}\n"
-        f"KAM source: 본문 {kam_from_body} + API {kam_from_api} = {kam_from_body + kam_from_api} / {len(df)}",
+        f"KAM source: 본문 {kam_from_body} + API {kam_from_api} = {kam_from_body + kam_from_api} / {len(df)}\n"
+        f"HTML 본문 추출: {html_extracted} (32K 초과 truncate {html_truncated})",
         flush=True,
     )
 
     # 4) 컬럼 추가/갱신
     df["핵심감사사항(본문)"] = new_kam
     df["감사보고서 본문 전체"] = new_body  # 줄바꿈 보존 버전으로 덮어씀
+    df["감사보고서 본문(HTML)"] = new_body_html  # 태그 보존 — Streamlit st.html 렌더링용
 
-    # 컬럼 순서: 핵심감사사항(KAM) 옆에 (본문) 배치.
+    # 컬럼 순서 정리.
     cols = list(df.columns)
     if "핵심감사사항(본문)" in cols:
         cols.remove("핵심감사사항(본문)")
@@ -170,6 +192,13 @@ def main() -> int:
             cols.insert(idx, "핵심감사사항(본문)")
         else:
             cols.append("핵심감사사항(본문)")
+    if "감사보고서 본문(HTML)" in cols:
+        cols.remove("감사보고서 본문(HTML)")
+        if "감사보고서 본문 전체" in cols:
+            idx = cols.index("감사보고서 본문 전체") + 1
+            cols.insert(idx, "감사보고서 본문(HTML)")
+        else:
+            cols.append("감사보고서 본문(HTML)")
     df = df[cols]
 
     # 5) 저장

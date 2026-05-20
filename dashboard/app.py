@@ -127,7 +127,18 @@ if event.selection.rows:
             f"📝 {col} ({len(text):,}자)",
             expanded=is_body,  # 본문 전체는 기본 펼침
         ):
-            st.text(text)
+            if is_body and "감사보고서 본문(HTML)" in row.index:
+                # 원본 서식(표/문단/스타일) 보존된 HTML 본문을 iframe 으로 렌더링.
+                html_body = str(row.get("감사보고서 본문(HTML)") or "").strip()
+                if html_body:
+                    st.html(html_body)
+                    with st.expander("📄 평문 버전 (줄바꿈만)", expanded=False):
+                        st.text(text)
+                else:
+                    st.info("HTML 본문이 없어 평문으로 표시합니다.")
+                    st.text(text)
+            else:
+                st.text(text)
 else:
     st.info("👆 표에서 행을 클릭하면 감사보고서 본문 전체를 볼 수 있습니다.")
 

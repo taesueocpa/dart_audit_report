@@ -100,6 +100,58 @@ def extract_kam_full_block(text: str) -> str | None:
     return block[:_KAM_OUT_LIMIT]
 
 
+# --- 감사보고서 본문 HTML 슬라이스 ---------------------------------------------
+# raw HTML 그대로에서 본문 시작/끝을 찾아 태그 보존 슬라이스. 평문화하지 않음.
+# 본문에는 태그가 글자 사이에 끼어들 수 있으므로 글자 사이 임의 문자 \s* 허용.
+_HTML_HEAD_PAT = re.compile(
+    r"독\s*립\s*된\s*감\s*사\s*인\s*의\s*감\s*사\s*보\s*고\s*서",
+    re.I,
+)
+_HTML_END_CLAUSE = re.compile(
+    r"이\s*감\s*사\s*보\s*고\s*서\s*가?\s*수\s*정\s*될\s*수\s*도\s*있\s*습\s*니\s*다\s*\.?"
+)
+_HTML_END_ATTACH = re.compile(r"\(\s*첨\s*부\s*\)\s*재\s*무\s*제\s*표")
+_HTML_BODY_MIN_LEN = 200
+_HTML_BODY_MAX_LEN = 200_000
+
+
+def extract_audit_body_html(raw_html: str) -> str | None:
+    """raw HTML 에서 감사보고서 본문 부분만 태그 보존 슬라이스.
+
+    - 시작: 두 번째 '독립된 감사인의 감사보고서' (첫 번째는 보통 목차 항목)
+    - 끝  : 결구 '이 감사보고서가 수정될 수도 있습니다' 까지 포함
+            (없으면 '(첨부)재무제표' 헤더 직전, 그것도 없으면 raw 끝)
+    """
+    if not raw_html:
+        return None
+    matches = list(_HTML_HEAD_PAT.finditer(raw_html))
+    if not matches:
+        return None
+    start_m = matches[1] if len(matches) >= 2 else matches[0]
+    start = start_m.start()
+
+    clause_m = _HTML_END_CLAUSE.search(raw_html, pos=start_m.end())
+    attach_m = _HTML_END_ATTACH.search(raw_html, pos=start_m.end())
+
+    if clause_m and (not attach_m or clause_m.start() < attach_m.start()):
+        end = clause_m.end()
+        # 결구 직후 closing tag 까지 확장 (HTML 무결성)
+        for tag in ("P", "TABLE", "DIV"):
+            close_idx = raw_html.find(f"</{tag}>", end)
+            if close_idx != -1 and close_idx - end < 300:
+                end = close_idx + len(f"</{tag}>")
+                break
+    elif attach_m:
+        end = attach_m.start()
+    else:
+        end = len(raw_html)
+
+    block = raw_html[start:end]
+    if len(block) < _HTML_BODY_MIN_LEN:
+        return None
+    return block[:_HTML_BODY_MAX_LEN]
+
+
 # --- 감사의견 라벨 -------------------------------------------------------------
 _OPINION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("부적정의견", re.compile(r"부적정\s*의견")),
