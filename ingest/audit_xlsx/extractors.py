@@ -1,77 +1,117 @@
-"""감사보고서 평문에서 주요 정보를 정규식으로 뽑는 순수 함수 모음.
+"""감사보고서 본문에서 정보를 뽑는 순수 정규식 추출기 모음.
 
-dart_kam.audit_extractors 의 추출 로직을 그대로 이식. 단,
-:func:`extract_standalone_audit_report_body` 는 종료 마커를 *본문 슬라이스 내
-마지막 매치*로 사용하도록 보강 (이전엔 첫 매치를 끝으로 잡아 KAM/회계법인이 잘렸음).
+모든 함수는 부수효과 없고 입력 텍스트만 받아 결과를 반환한다.
+실제 사용 위치 (어디서 import 되는지):
+
+* :func:`extract_standalone_audit_report_body` — parse_audit, reparse_from_cache
+* :func:`extract_kam_full_block`              — parse_audit, reparse_from_cache
+* :func:`extract_audit_body_html`             — reparse_from_cache
+* :func:`extract_cpa_partner`                 — parse_audit
+* :func:`extract_other_matters`               — parse_audit
+
+설계 원칙
+~~~~~~~~~
+
+표준 감사보고서의 절 순서는 ``감사의견 → 감사의견근거 → [핵심감사사항] →
+[강조사항] → [기타사항] → 재무제표에 대한 경영진과 지배기구의 책임 →
+독립된 감사인의 책임`` 이다. 각 절 추출은 *시작 헤더* + *다음 절 헤더* 의
+정규식 매칭으로 슬라이스한다.
+
+본문은 줄바꿈을 보존한다 (가독성). 줄 안의 공백만 단일화.
 """
 from __future__ import annotations
 
 import re
-from typing import Any
 
-_WS = re.compile(r"\s+")
+# ---------------------------------------------------------------------------
+# 공통 헬퍼
+# ---------------------------------------------------------------------------
 
-# --- 본문 슬라이스 -------------------------------------------------------------
-# 본문 시작: "독립된 감사인의 감사보고서 [회사이름] 주주 및 이사회 귀중" 표준 헤더.
-# 회사명 길이 가변(보통 50자 이내)이므로 300자 안에 "주주 및 이사회 귀중"이 따라오면
-# 그 위치를 본문 시작으로 본다. 목차에 등장하는 단독 "독립된 감사인의 감사보고서" 는
-# 뒤에 회사명/주주귀중이 따라오지 않아 자연스럽게 제외.
-_AUDIT_REPORT_HEAD = re.compile(
-    r"독립된\s*감사인의\s*감사보고서[\s\S]{1,300}?주주\s*(?:및|,)\s*이사회\s*귀중"
-)
-# 본문 끝 후보:
-#  1) 결구 — 표준 감사보고서 마지막 문장 (가장 신뢰할 수 있음). 매치 끝까지 본문에 포함.
-#  2) "(첨부)재 무 제 표" 헤더 — 사업보고서 첨부형. 매치 *시작* 직전까지.
-# 둘 중 더 빠른 위치를 본문 끝으로 사용.
-_END_BY_CLAUSE = re.compile(r"이\s*감사보고서가\s*수정될\s*수도\s*있습니다\.?")
-_END_BY_ATTACH = re.compile(r"\(\s*첨\s*부\s*\)\s*재\s*무\s*제\s*표")
-_MAX_AUDIT_REPORT_BODY = 2_000_000
-_MIN_AUDIT_REPORT_BODY = 40
+_INLINE_WS = re.compile(r"[ \t\r\f\v]+")
+_HANGUL_GAP = re.compile(r"([가-힣])\s([가-힣])")
 
 
-def _normalize_block_keep_newlines(block: str) -> str:
-    """줄별로 공백 정리 + 빈 줄 제거. 줄바꿈은 보존."""
-    lines = (re.sub(r"[ \t\r\f\v]+", " ", line).strip() for line in block.split("\n"))
+def _normalize_lines(text: str) -> str:
+    """줄 단위로 인라인 공백만 단일화 + 빈 줄 제거 (줄바꿈 보존)."""
+    lines = (_INLINE_WS.sub(" ", line).strip() for line in text.split("\n"))
     return "\n".join(line for line in lines if line)
 
 
-def extract_standalone_audit_report_body(text: str) -> str | None:
-    """'독립된 감사인의 감사보고서 [회사명] 주주 및 이사회 귀중' ~ 결구 또는 첨부 직전.
+def collapse_hangul_spaces(s: str) -> str:
+    """'동 현 회 계 법 인' 처럼 한글 사이 단일 공백을 제거. 영문/숫자 공백은 보존."""
+    s = _INLINE_WS.sub(" ", s).strip()
+    prev = None
+    while s != prev:
+        prev, s = s, _HANGUL_GAP.sub(r"\1\2", s)
+    return s
 
-    줄바꿈은 보존 (가독성). 줄 안의 공백만 단일화.
+
+# ---------------------------------------------------------------------------
+# 1) 감사보고서 본문 슬라이스 (평문)
+# ---------------------------------------------------------------------------
+#
+# 시작 = "독립된 감사인의 감사보고서 [회사명] 주주 및 이사회 귀중" 표준 헤더.
+# 회사명 가변 길이라 [\s\S]{1,300}? 로 lazy 매칭. 목차에 단독 등장하는
+# "독립된 감사인의 감사보고서" 는 회사명+주주귀중이 안 따라오므로 자동 제외.
+#
+# 끝 = 결구 또는 (첨부)재무제표 중 더 빠른 위치.
+#  - 결구는 본문에 포함 (`match.end()`)
+#  - (첨부) 헤더는 직전까지 (`match.start()`)
+
+_BODY_HEAD = re.compile(
+    r"독립된\s*감사인의\s*감사보고서[\s\S]{1,300}?주주\s*(?:및|,)\s*이사회\s*귀중"
+)
+_BODY_END_CLAUSE = re.compile(r"이\s*감사보고서가\s*수정될\s*수도\s*있습니다\.?")
+_BODY_END_ATTACH = re.compile(r"\(\s*첨\s*부\s*\)\s*재\s*무\s*제\s*표")
+_BODY_MAX_LEN = 2_000_000
+_BODY_MIN_LEN = 40
+
+
+def extract_standalone_audit_report_body(text: str) -> str | None:
+    """감사보고서 본문 슬라이스 (평문, 줄바꿈 보존).
+
+    Returns ``None`` 일 때:
+      - 시작 헤더 매치 실패 (본문 형식이 비표준)
+      - 슬라이스 결과가 ``_BODY_MIN_LEN`` 미만
     """
-    head = _AUDIT_REPORT_HEAD.search(text)
+    head = _BODY_HEAD.search(text)
     if head is None:
         return None
     start = head.start()
-    window = text[start : start + _MAX_AUDIT_REPORT_BODY]
+    window = text[start : start + _BODY_MAX_LEN]
 
-    clause = _END_BY_CLAUSE.search(window)
-    attach = _END_BY_ATTACH.search(window)
-
+    clause = _BODY_END_CLAUSE.search(window)
+    attach = _BODY_END_ATTACH.search(window)
     if clause and (not attach or clause.start() < attach.start()):
-        end_pos = clause.end()  # 결구 자체는 본문에 포함
+        end_pos = clause.end()
     elif attach:
-        end_pos = attach.start()  # (첨부) 헤더 직전까지
+        end_pos = attach.start()
     else:
         end_pos = len(window)
 
-    block = _normalize_block_keep_newlines(window[:end_pos])
-    if len(block) < _MIN_AUDIT_REPORT_BODY:
-        return None
-    return block
+    block = _normalize_lines(window[:end_pos])
+    return block if len(block) >= _BODY_MIN_LEN else None
 
 
-# --- 핵심감사사항 (KAM) 본문 추출 -------------------------------------------------
-# "핵심감사사항" 헤더 ~ 다음 표준 절 (기타사항/책임 단락) 직전.
+# ---------------------------------------------------------------------------
+# 2) 핵심감사사항 (KAM) 전체 문단 (평문)
+# ---------------------------------------------------------------------------
+#
+# 시작 = "핵심감사사항" 또는 "Key Audit Matters" 헤더.
+# 끝   = 다음 절 후보 중 가장 빠른 위치 (강조사항/기타사항/책임 단락).
+#
+# negative lookahead 로 "기타사항들/외/을 …" 같은 본문 내 일반 표현이
+# 절 헤더로 잘못 잡히는 false positive 차단.
+
 _KAM_HEADER = re.compile(
     r"(?<![가-힣])(?:핵심\s*감사\s*사항|Key\s*Audit\s*Matters)(?![가-힣]|들)", re.I
 )
-# 표준 감사보고서 절 순서: 감사의견 → 감사의견근거 → KAM → [강조사항] → [기타사항]
-# → 경영진 책임 → 감사인 책임. KAM 다음 절 후보는 강조사항/기타사항/책임 단락.
+# 절 헤더 false positive 차단용 — '강조사항 외에는' / '기타사항들' 등 제외.
+_PARTICLE_BLOCK = r"(?!\s*(?:외|을|은|는|이|가|에|에서|의|들))"
+
 _KAM_END_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"(?<![가-힣])강\s*조\s*사\s*항(?![가-힣])(?!\s*(?:외|을|은|는|이|가|에|에서|의|들))"),
-    re.compile(r"(?<![가-힣])기\s*타\s*사\s*항(?![가-힣])(?!\s*(?:외|을|은|는|이|가|에|에서|의|들))"),
+    re.compile(rf"(?<![가-힣])강\s*조\s*사\s*항(?![가-힣]){_PARTICLE_BLOCK}"),
+    re.compile(rf"(?<![가-힣])기\s*타\s*사\s*항(?![가-힣]){_PARTICLE_BLOCK}"),
     re.compile(r"(?:연결)?재무제표에\s*대한\s*경영(?:자|진)과?\s*(?:및\s*)?지배기구의\s*책임"),
     re.compile(r"(?:연결)?재무제표\s*감사에\s*대한\s*감사인의\s*책임"),
     re.compile(r"독립된\s*감사인의\s*책임"),
@@ -81,68 +121,78 @@ _KAM_MIN_LEN = 30
 
 
 def extract_kam_full_block(text: str) -> str | None:
-    """본문에서 '핵심감사사항' 헤더부터 다음 표준 섹션 직전까지 전체 문단.
+    """'핵심감사사항' 헤더 ~ 다음 표준 절 직전 전체 문단. 줄바꿈 보존.
 
-    KAM 항목별 분리 없이 헤더~다음 절 직전까지를 한 덩어리로 반환. 줄바꿈 보존.
+    KAM 항목별 분리는 하지 않고 한 덩어리로 반환.
     """
-    m = _KAM_HEADER.search(text)
-    if m is None:
+    head = _KAM_HEADER.search(text)
+    if head is None:
         return None
-    start = m.start()
+    start = head.start()
     end = len(text)
     for pat in _KAM_END_PATTERNS:
-        em = pat.search(text, pos=m.end())
-        if em:
-            end = min(end, em.start())
-    block = _normalize_block_keep_newlines(text[start:end])
-    if len(block) < _KAM_MIN_LEN:
-        return None
-    return block[:_KAM_OUT_LIMIT]
+        m = pat.search(text, pos=head.end())
+        if m:
+            end = min(end, m.start())
+    block = _normalize_lines(text[start:end])
+    return block[:_KAM_OUT_LIMIT] if len(block) >= _KAM_MIN_LEN else None
 
 
-# --- 감사보고서 본문 HTML 슬라이스 ---------------------------------------------
-# raw HTML 그대로에서 본문 시작/끝을 찾아 태그 보존 슬라이스. 평문화하지 않음.
-# 본문에는 태그가 글자 사이에 끼어들 수 있으므로 글자 사이 임의 문자 \s* 허용.
-_HTML_HEAD_PAT = re.compile(
-    r"독\s*립\s*된\s*감\s*사\s*인\s*의\s*감\s*사\s*보\s*고\s*서",
-    re.I,
-)
+# ---------------------------------------------------------------------------
+# 3) 감사보고서 본문 HTML 슬라이스 (태그 보존)
+# ---------------------------------------------------------------------------
+#
+# Streamlit ``st.html`` 로 표·문단·스타일 그대로 렌더링하기 위한 슬라이스.
+# 평문화하지 않고 raw HTML 그대로 검색. 글자 사이에 태그가 끼어들 수 있으므로
+# 글자 사이 ``\s*`` 허용.
+#
+# 시작 = 두 번째 "독립된 감사인의 감사보고서" (첫 번째는 보통 목차 항목).
+# 끝   = 결구 (closing 태그까지 확장) 또는 (첨부)재무제표 직전.
+
+_HTML_HEAD = re.compile(r"독\s*립\s*된\s*감\s*사\s*인\s*의\s*감\s*사\s*보\s*고\s*서", re.I)
 _HTML_END_CLAUSE = re.compile(
     r"이\s*감\s*사\s*보\s*고\s*서\s*가?\s*수\s*정\s*될\s*수\s*도\s*있\s*습\s*니\s*다\s*\.?"
 )
 _HTML_END_ATTACH = re.compile(r"\(\s*첨\s*부\s*\)\s*재\s*무\s*제\s*표")
 _HTML_BODY_MIN_LEN = 200
 _HTML_BODY_MAX_LEN = 200_000
+_HTML_CLOSE_TAG_LOOKAHEAD = 300
+_HTML_CLOSE_TAGS: tuple[str, ...] = ("P", "TABLE", "DIV")
+
+
+def _extend_to_closing_tag(html: str, pos: int) -> int:
+    """``pos`` 직후 가까이 있는 closing tag 까지 끝 위치를 확장 (HTML 무결성).
+
+    찾은 close tag 가 ``_HTML_CLOSE_TAG_LOOKAHEAD`` 자 이내이면 그 뒤까지.
+    """
+    for tag in _HTML_CLOSE_TAGS:
+        close_idx = html.find(f"</{tag}>", pos)
+        if close_idx != -1 and close_idx - pos < _HTML_CLOSE_TAG_LOOKAHEAD:
+            return close_idx + len(f"</{tag}>")
+    return pos
 
 
 def extract_audit_body_html(raw_html: str) -> str | None:
     """raw HTML 에서 감사보고서 본문 부분만 태그 보존 슬라이스.
 
-    - 시작: 두 번째 '독립된 감사인의 감사보고서' (첫 번째는 보통 목차 항목)
-    - 끝  : 결구 '이 감사보고서가 수정될 수도 있습니다' 까지 포함
-            (없으면 '(첨부)재무제표' 헤더 직전, 그것도 없으면 raw 끝)
+    Returns ``None`` 일 때:
+      - 시작 마커 매치 실패
+      - 슬라이스 결과가 ``_HTML_BODY_MIN_LEN`` 미만
     """
     if not raw_html:
         return None
-    matches = list(_HTML_HEAD_PAT.finditer(raw_html))
-    if not matches:
+    heads = list(_HTML_HEAD.finditer(raw_html))
+    if not heads:
         return None
-    start_m = matches[1] if len(matches) >= 2 else matches[0]
-    start = start_m.start()
+    head = heads[1] if len(heads) >= 2 else heads[0]
+    start = head.start()
 
-    clause_m = _HTML_END_CLAUSE.search(raw_html, pos=start_m.end())
-    attach_m = _HTML_END_ATTACH.search(raw_html, pos=start_m.end())
-
-    if clause_m and (not attach_m or clause_m.start() < attach_m.start()):
-        end = clause_m.end()
-        # 결구 직후 closing tag 까지 확장 (HTML 무결성)
-        for tag in ("P", "TABLE", "DIV"):
-            close_idx = raw_html.find(f"</{tag}>", end)
-            if close_idx != -1 and close_idx - end < 300:
-                end = close_idx + len(f"</{tag}>")
-                break
-    elif attach_m:
-        end = attach_m.start()
+    clause = _HTML_END_CLAUSE.search(raw_html, pos=head.end())
+    attach = _HTML_END_ATTACH.search(raw_html, pos=head.end())
+    if clause and (not attach or clause.start() < attach.start()):
+        end = _extend_to_closing_tag(raw_html, clause.end())
+    elif attach:
+        end = attach.start()
     else:
         end = len(raw_html)
 
@@ -152,234 +202,98 @@ def extract_audit_body_html(raw_html: str) -> str | None:
     return block[:_HTML_BODY_MAX_LEN]
 
 
-# --- 감사의견 라벨 -------------------------------------------------------------
-_OPINION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("부적정의견", re.compile(r"부적정\s*의견")),
-    ("의견거절", re.compile(r"의견\s*거절|거절\s*의견")),
-    ("한정의견", re.compile(r"한정\s*의견")),
-    ("감사범위제한", re.compile(r"감사의\s*범위가\s*한|감사\s*범위\s*제한")),
-    ("적정의견", re.compile(r"적정\s*의견|공정하게\s*표시|재무제표는.*적정")),
-)
-NON_CLEAN_OPINIONS = frozenset({"한정의견", "부적정의견", "의견거절", "감사범위제한"})
+# ---------------------------------------------------------------------------
+# 4) 업무수행 공인회계사 이름
+# ---------------------------------------------------------------------------
+#
+# 표준 패턴 5종을 우선순위 순으로 시도. 본문 말미 12 KB 에서 먼저 검색
+# (서명란 위치). 못 찾으면 본문 전체 fallback.
 
-
-def classify_opinion(text: str) -> str | None:
-    """문서에서 가장 먼저 등장한 의견 라벨."""
-    earliest: tuple[int, str] | None = None
-    for label, pattern in _OPINION_PATTERNS:
-        m = pattern.search(text)
-        if m is None:
-            continue
-        if earliest is None or m.start() < earliest[0]:
-            earliest = (m.start(), label)
-    return earliest[1] if earliest else None
-
-
-# --- 감사인 / 공인회계사 ----------------------------------------------------------
-# 1차: 공백 없는 표준형 — "동현회계법인", "삼일회계법인" 등.
-_AUDITOR_FIRM_RE = re.compile(r"([가-힣A-Za-z0-9·]{1,15}회계법인)")
-# 2차: 표 셀이 한 글자씩 분리된 형태 — "동 현 회 계 법 인" / "삼 일 회 계 법 인".
-_AUDITOR_FIRM_SPACED_RE = re.compile(
-    r"((?:[가-힣]\s+){1,12}회\s*계\s*법\s*인)"
-)
-_AUDITOR_FIRM_OUT_LIMIT = 160
-
-
-def _normalize_korean_spacing(s: str) -> str:
-    """'동 현 회 계 법 인' 처럼 한글 사이에 단일 공백이 있는 경우 공백 제거.
-
-    영문/숫자/구두점 사이 공백은 보존 (예: 'KPMG 삼정' 은 그대로).
-    """
-    s = _WS.sub(" ", s).strip()
-    while True:
-        new = re.sub(r"([가-힣])\s([가-힣])", r"\1\2", s)
-        if new == s:
-            return s
-        s = new
-
-
-def extract_auditor_firm(text: str) -> str | None:
-    head = text[:400_000]
-    candidates: list[str] = []
-    for m in _AUDITOR_FIRM_RE.finditer(head):
-        candidates.append(m.group(1))
-    for m in _AUDITOR_FIRM_SPACED_RE.finditer(head):
-        candidates.append(m.group(1))
-    for raw in candidates:
-        cleaned = _normalize_korean_spacing(raw)
-        # "회계법인" 단독이거나 너무 짧은 매치는 제외.
-        if cleaned == "회계법인" or len(cleaned) < 5:
-            continue
-        return cleaned[:_AUDITOR_FIRM_OUT_LIMIT]
-    return None
-
-
-# 공인회계사·업무수행이사 이름 추출 패턴 (우선순위 순).
+_CPA_NAME_RE = r"[가-힣A-Za-z·\s]{2,30}?"
 _CPA_PATTERNS: tuple[re.Pattern[str], ...] = (
     # "업무수행이사는 공인회계사 OOO 입니다"
-    re.compile(
-        r"업무수행\s*이사는?\s*공인회계사\s+([가-힣A-Za-z·\s]{2,30}?)\s*(?:입니다|임\.)"
-    ),
+    re.compile(rf"업무수행\s*이사는?\s*공인회계사\s+({_CPA_NAME_RE})\s*(?:입니다|임\.)"),
     # "업무수행이사는 OOO 입니다"
-    re.compile(r"업무수행\s*이사는?\s+([가-힣A-Za-z·\s]{2,30}?)\s*(?:입니다|임\.)"),
+    re.compile(rf"업무수행\s*이사는?\s+({_CPA_NAME_RE})\s*(?:입니다|임\.)"),
     # 보고서 말미: "공인회계사 OOO 입니다"
-    re.compile(
-        r"공인회계사\s+([가-힣A-Za-z·\s]{2,30}?)\s*(?:입니다|임\.|이고|으로\s*갑)"
-    ),
+    re.compile(rf"공인회계사\s+({_CPA_NAME_RE})\s*(?:입니다|임\.|이고|으로\s*갑)"),
     # "업무수행 공인회계사 : OOO"
     re.compile(
-        r"업무수행\s*공인회계사\s*[:：\s]*([가-힣A-Za-z·\s]{2,30}?)"
+        rf"업무수행\s*공인회계사\s*[:：\s]*({_CPA_NAME_RE})"
         r"(?=\s*(?:\(|공인회계사\)|등록|$|\n))"
     ),
     # "등록 공인회계사 : OOO"
     re.compile(r"등록\s*공인회계사\s*[:：\s]*([가-힣A-Za-z·\s]{2,30})"),
 )
+_CPA_TAIL_LEN = 12_000
+_CPA_MIN_LEN = 2
+_CPA_MAX_LEN = 30
 
 
-def _clean_cpa(raw: str, *, max_len: int = 30) -> str | None:
-    s = _normalize_korean_spacing(raw)
-    if not (2 <= len(s) <= max_len):
+def _clean_cpa_name(raw: str) -> str | None:
+    """매치된 이름 후보를 정규화. '회계법인'/'공인회계사' 포함 시 무효."""
+    s = collapse_hangul_spaces(raw)
+    if not (_CPA_MIN_LEN <= len(s) <= _CPA_MAX_LEN):
         return None
     if "회계법인" in s or "공인회계사" in s:
         return None
     return s
 
 
+def _try_cpa_patterns(text: str) -> str | None:
+    for pattern in _CPA_PATTERNS:
+        m = pattern.search(text)
+        if m:
+            name = _clean_cpa_name(m.group(1))
+            if name:
+                return name
+    return None
+
+
 def extract_cpa_partner(text: str) -> str | None:
-    # 본문 말미 8000자에서 우선 검색 (보고자 서명란 위치).
-    tail = text[-12000:]
-    for regex in _CPA_PATTERNS:
-        m = regex.search(tail)
-        if m:
-            n = _clean_cpa(m.group(1))
-            if n:
-                return n
-    # 못 찾으면 본문 전체 fallback.
-    for regex in _CPA_PATTERNS:
-        m = regex.search(text)
-        if m:
-            n = _clean_cpa(m.group(1))
-            if n:
-                return n
-    return None
+    """업무수행 공인회계사 이름. 말미 12KB 우선 → 본문 전체 fallback."""
+    return _try_cpa_patterns(text[-_CPA_TAIL_LEN:]) or _try_cpa_patterns(text)
 
 
-# --- 회계기준 ------------------------------------------------------------------
-_KIFRS_RE = re.compile(r"한국채택국제회계기준|한국\s*채택\s*국제\s*회계기준")
-_KGAAP_RE = re.compile(r"일반기업회계기준")
+# ---------------------------------------------------------------------------
+# 5) 기타사항 (Other Matters) 절 본문
+# ---------------------------------------------------------------------------
+#
+# 헤더 매치 + stop 패턴 사이를 슬라이스. EOM 끝 마커는 stop 에 안 둔다 —
+# '강조사항 외에는' 같은 본문 일반 표현이 헤더로 잘못 잡혀 본문이 잘리는
+# 케이스 방지.
 
-
-def detect_accounting_standard(text: str) -> str | None:
-    kifrs = _KIFRS_RE.search(text)
-    kgaap = _KGAAP_RE.search(text)
-    if kifrs and (not kgaap or kifrs.start() <= kgaap.start()):
-        return "한국채택국제회계기준"
-    if kgaap:
-        return "일반기업회계기준"
-    return None
-
-
-# --- 강조사항 / 기타사항 / 핵심감사사항 --------------------------------------------
-# EOM·기타사항 헤더는 단어 단독으로 절을 시작해야 한다. 본문에 등장하는
-# "강조사항 외에는", "기타사항들" 등은 절 헤더가 아니므로 negative-lookahead 로 차단.
-_EOM_HEADER = re.compile(
-    r"(?<![가-힣])강\s*조\s*사\s*항(?![가-힣])(?!\s*(?:외|을|은|는|이|가|에|에서|의|들))"
-    r"|Emphasis\s+of\s+Matter",
-    re.I,
-)
 _OTHER_HEADER = re.compile(
-    r"(?<![가-힣])기\s*타\s*사\s*항(?![가-힣])(?!\s*(?:외|을|은|는|이|가|에|에서|의|들))"
+    rf"(?<![가-힣])기\s*타\s*사\s*항(?![가-힣]){_PARTICLE_BLOCK}"
     r"|기\s*타\s*의\s*감사\s*사항"
     r"|Other\s+Matter",
     re.I,
 )
-_KAM_HEADER = re.compile(r"(핵심\s*감사사항|핵심감사사항|Key\s*Audit\s*Matters)", re.I)
-
-# 각 절의 표준 후속 절(=stop)들. 긴 본문이 잘 잘리도록 명확한 헤더만 사용.
-_RESPONSIBILITY_STOPS = (
-    re.compile(
-        r"(?:연결)?재무제표에\s*대한\s*경영(?:자|진)과?\s*(?:및\s*)?지배기구의\s*책임"
-    ),
+_OTHER_STOPS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?:연결)?재무제표에\s*대한\s*경영(?:자|진)과?\s*(?:및\s*)?지배기구의\s*책임"),
     re.compile(r"(?:연결)?재무제표\s*감사에\s*대한\s*감사인의\s*책임"),
     re.compile(r"독립된\s*감사인의\s*책임"),
+    re.compile(r"핵심\s*감사사항|핵심감사사항|Key\s*Audit", re.I),
 )
-
-_SECTION_MIN_LEN = 25
-_SECTION_OUT_LIMIT = 30_000
-_KAM_OUT_LIMIT = 500_000
+_OTHER_OUT_LIMIT = 30_000
+_OTHER_MIN_LEN = 25
 
 
-def _next_section_start(text: str, start: int, patterns: tuple[re.Pattern[str], ...]) -> int:
+def _section_end(text: str, start: int, stops: tuple[re.Pattern[str], ...]) -> int:
+    """``start`` 이후로 가장 먼저 매칭되는 stop 위치 (없으면 ``len(text)``)."""
     end = len(text)
-    for p in patterns:
-        m = p.search(text, pos=start)
+    for pattern in stops:
+        m = pattern.search(text, pos=start)
         if m:
             end = min(end, m.start())
     return end
 
 
-def _extract_section(text: str, header: re.Pattern[str], stops: tuple[re.Pattern[str], ...]) -> str | None:
-    h = header.search(text)
-    if not h:
-        return None
-    end = _next_section_start(text, h.end(), stops)
-    body = _WS.sub(" ", text[h.end() : end]).strip()
-    if len(body) < _SECTION_MIN_LEN:
-        return None
-    return body[:_SECTION_OUT_LIMIT]
-
-
-# EOM 다음에 올 수 있는 절: 기타사항, 핵심감사사항, 책임 단락.
-_EOM_STOPS = _RESPONSIBILITY_STOPS + (
-    _OTHER_HEADER,
-    re.compile(r"핵심\s*감사사항|핵심감사사항|Key\s*Audit", re.I),
-)
-# 기타사항 다음에 올 수 있는 절: 책임 단락 (본문에 '강조사항 외에는' 같은
-# 거짓 매치가 있어도 자르지 않도록 강조사항을 stop 에서 제외).
-_OTHER_STOPS = _RESPONSIBILITY_STOPS + (
-    re.compile(r"핵심\s*감사사항|핵심감사사항|Key\s*Audit", re.I),
-)
-_KAM_STOP = re.compile(
-    r"(감사가\s*재무제표\s*감사를\s*수행|기타\s*필수적\s*감사|"
-    r"(?:연결)?재무제표에\s*대한\s*경영(?:자|진)과?\s*(?:및\s*)?지배기구의\s*책임|"
-    r"독립된\s*감사인의\s*책임|"
-    r"(?<![가-힣])강\s*조\s*사\s*항(?![가-힣])(?!\s*(?:외|을|은|는|이|가|에|에서|의|들))|"
-    r"(?<![가-힣])기\s*타\s*사\s*항(?![가-힣])(?!\s*(?:외|을|은|는|이|가|에|에서|의|들)))"
-)
-
-
-def extract_emphasis_of_matter(text: str) -> str | None:
-    return _extract_section(text, _EOM_HEADER, _EOM_STOPS)
-
-
 def extract_other_matters(text: str) -> str | None:
-    return _extract_section(text, _OTHER_HEADER, _OTHER_STOPS)
-
-
-def extract_kam_section(text: str) -> str | None:
-    m = _KAM_HEADER.search(text)
-    if not m:
+    """'기타사항' 절 본문. 단일 공백 정규화 (줄바꿈은 보존 안 함)."""
+    header = _OTHER_HEADER.search(text)
+    if header is None:
         return None
-    stop = _KAM_STOP.search(text, pos=m.end())
-    end = stop.start() if stop else len(text)
-    block = _WS.sub(" ", text[m.start() : end]).strip()
-    if len(block) < 12:
-        return None
-    return block[:_KAM_OUT_LIMIT]
-
-
-# --- 통합 ---------------------------------------------------------------------
-def analyze_audit_text(flat_text: str) -> dict[str, Any]:
-    """평문 → 결과 dict (XLSX 행으로 직접 들어가는 컬럼들)."""
-    body = extract_standalone_audit_report_body(flat_text)
-    work = body if body else flat_text
-    return {
-        "opinion_label": classify_opinion(work),
-        "accounting_standard": detect_accounting_standard(work),
-        "auditor_firm": extract_auditor_firm(work),
-        "cpa_partner_name": extract_cpa_partner(work),
-        "kam_section": extract_kam_section(work),
-        "emphasis_of_matter": extract_emphasis_of_matter(work),
-        "other_matters": extract_other_matters(work),
-        "audit_report_body": body,
-    }
+    end = _section_end(text, header.end(), _OTHER_STOPS)
+    body = re.sub(r"\s+", " ", text[header.end() : end]).strip()
+    return body[:_OTHER_OUT_LIMIT] if len(body) >= _OTHER_MIN_LEN else None
