@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -35,6 +36,48 @@ def _load(path: Path) -> pd.DataFrame:
     return df
 
 
+_HTML_COL = "감사보고서 본문(HTML)"
+
+# 감사의견 표준 토큰(공백 제거 기준) → 통일 표기. 연도/회사별 표기 흔들림 해소.
+_STD_OPINION = {
+    "적정": "적정의견", "적정의견": "적정의견",
+    "한정": "한정의견", "한정의견": "한정의견",
+    "부적정": "부적정의견", "부적정의견": "부적정의견",
+    "의견거절": "의견거절",
+}
+
+
+def _norm_opinion(v: str) -> str:
+    """감사의견 표준화 — 공백 제거 후 표준 토큰이면 통일('적 정'→'적정의견'), 아니면 공백만 단일화."""
+    nospace = re.sub(r"\s+", "", v)
+    if nospace in _STD_OPINION:
+        return _STD_OPINION[nospace]
+    return re.sub(r"\s+", " ", v).strip()
+
+
+def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
+    r"""줄바꿈/표기 정규화 — 깔끔한 단일 DB.
+
+    - 사업연도: 내부 공백·개행 단일화 + '(' 앞 공백 제거 ("제35기\n(당기)" → "제35기(당기)")
+    - 감사의견: 공백·개행 정리 + 표기 통일(적정→적정의견 등) — 연도별 표기 불일치 해소
+    - 전 컬럼: 줄끝 공백·3연속+ 빈줄 정리 + 외곽 strip (본문 문단 개행은 보존, HTML 원형 보존)
+    """
+    if "사업연도" in df.columns:
+        df["사업연도"] = (
+            df["사업연도"].fillna("").astype(str)
+            .str.replace(r"\s+", " ", regex=True).str.strip()
+            .str.replace(r"\s*\(", "(", regex=True)
+        )
+    if "감사의견" in df.columns:
+        df["감사의견"] = df["감사의견"].fillna("").astype(str).map(_norm_opinion)
+    for c in df.columns:
+        col = df[c].fillna("").astype(str).str.replace(r"[ \t]+\n", "\n", regex=True)
+        if c != _HTML_COL:  # HTML 마크업은 빈줄 정리 제외(원형 보존)
+            col = col.str.replace(r"\n{3,}", "\n\n", regex=True)
+        df[c] = col.str.strip()
+    return df
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--years", type=int, nargs="+", required=True)
@@ -43,12 +86,21 @@ def main(argv: list[str] | None = None) -> int:
 
     settings = load_settings()
     print("로드:", flush=True)
-    frames = [_load(_V4)]
-    base_cols = list(frames[0].columns)
+    base = _load(_V4)
+    base_cols = list(base.columns)
+
+    # 재병합 시 해당 연도 기존 행 제거 → 연도 파일이 최신본을 대체(구버전·중복 방지)
+    drop_years = {str(y) for y in args.years}
+    fy_base = base["결산기준일"].fillna("").astype(str).str[:4]
+    kept = base[~fy_base.isin(drop_years)]
+    if len(kept) != len(base):
+        print(f"  v4 기존 {len(base) - len(kept)}행 제거(연도 {sorted(drop_years)} 대체)", flush=True)
+
+    frames = [kept]
     for y in args.years:
         p = settings.data_dir / f"audit_reports_y{y}.xlsx"
         if not p.exists():
-            print(f"ERR: {p} 없음 — fetch_year --year {y} 먼저 실행", file=sys.stderr)
+            print(f"ERR: {p} 없음 — fetch_year_api --year {y} 먼저 실행", file=sys.stderr)
             return 1
         df = _load(p)
         if list(df.columns) != base_cols:
@@ -66,6 +118,8 @@ def main(argv: list[str] | None = None) -> int:
         ascending=[True, False, True],
         kind="stable",
     ).reset_index(drop=True)
+    merged = _clean_df(merged)
+    print("정규화 완료(사업연도/감사의견/줄바꿈)", flush=True)
 
     tmp = args.dst.with_suffix(".tmp.xlsx")
     merged.to_excel(tmp, index=False, engine="openpyxl")

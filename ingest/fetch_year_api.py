@@ -1,28 +1,27 @@
-"""과거 사업연도 감사보고서 — 공식 document.xml API **전용** 수집 → v4 스키마 연도별 XLSX.
+"""과거 사업연도 감사보고서 수집 → v4 스키마 연도별 XLSX (API 우선 + viewer 폴백).
 
-viewer 스크래핑 없이 OPENDART 공식 API 만 사용한다:
+수집 전략
+~~~~~~~~~
+회사별로 **공식 API 우선**, 본문을 못 얻으면 **viewer 폴백**(웹 조회)으로 채운다.
 
-* ``dart.report(corp, '회계감사', year, '11011')`` → 구조화 4필드(감사인/의견/KAM/강조)
-* ``document.xml(사업보고서 접수번호)`` ZIP →
-    - 감사보고서 / 연결감사보고서 XML → 본문 평문·KAM본문·CPA·기타사항
-    - 사업보고서 본문 XML → 「내부통제에 관한 사항」
+1. `dart.report(corp, '회계감사', year, '11011')` → 구조화 4필드(감사인/의견/KAM/강조).
+2. `document.xml(사업보고서 접수번호)` ZIP →
+   - 감사보고서 / 연결감사보고서 XML(마크업) → 본문 평문·HTML본문·KAM본문·CPA·기타사항
+   - 사업보고서 본문 XML → 「내부통제에 관한 사항」
+3. document.xml ZIP 에 감사보고서가 없거나(별도 「감사보고서제출」 공시로 제출) 본문
+   추출 실패 시 → **viewer 폴백**: `parse_one`(2025 본문 파이프라인) 재사용으로
+   attach_docs+viewer.do 에서 본문·HTML·첨부제목·제출번호까지 수집.
 
-API 한계 (viewer 가 아니면 불가 — 과거연도에 비는 항목)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-* ``감사보고서 본문(HTML)`` 서식보존본은 viewer 렌더 결과라 비움 (평문만 채움).
-* ``첨부 제목``·``감사보고서제출 접수번호``는 attach_docs(viewer) 기반이라 비움.
-  (``사업보고서 접수번호``는 report() 응답으로 채움)
-* 일부(~8%) 회사는 document.xml ZIP 에 감사보고서 XML 미포함(첨부 별도/정정/6월결산)
-  → 본문 없이 구조화+내부통제만.
+`감사보고서 본문(HTML)` 은 (2) 의 경우 document.xml 마크업 슬라이스(서식은 DART CSS
+미동봉이라 평문 표 수준), (3) 의 경우 viewer 렌더 HTML.
 
-캐시: (year, corp_code) 단위 JSON → ``data/year_api/{year}_{corp_code}.json``.
-한도 초과(020/021) 시 graceful 중단, 재실행 시 캐시로 이어받기.
+캐시: (year, corp_code) JSON → `data/year_api/{year}_{corp}.json`. viewer raw HTML 은
+`data/raw_audit` 공용 캐시. 한도초과(020/021) 시 단락·이어받기.
 
 사용법
 ~~~~~~
-* dry-run:  ``python -m ingest.fetch_year_api --year 2024 --limit 5``
+* dry-run:  ``python -m ingest.fetch_year_api --year 2024 --limit 30``
 * 전체:     ``python -m ingest.fetch_year_api --year 2024``
-  → ``data/audit_reports_y{year}.xlsx`` (병합은 ``merge_years`` 가 담당)
 """
 from __future__ import annotations
 
@@ -44,6 +43,7 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 from audit_xlsx.extractors import (  # noqa: E402
+    extract_audit_body_html,
     extract_cpa_partner,
     extract_internal_control_summary,
     extract_kam_full_block,
@@ -55,7 +55,8 @@ from audit_xlsx.fetch_audit import (  # noqa: E402
     fetch_audit_opinion,
     html_to_text,
 )
-from audit_xlsx.settings import load_settings  # noqa: E402
+from audit_xlsx.parse_audit import parse_one  # noqa: E402
+from audit_xlsx.settings import Settings, load_settings  # noqa: E402
 from audit_xlsx.stock_to_corp import load_mapping  # noqa: E402
 from fetch_iacm_api import _DOC_NAME, fetch_document_zip  # noqa: E402
 from fetch_year import _COL_IC_SUMMARY, _V4_COLUMNS, _truncate_cell  # noqa: E402
@@ -71,7 +72,7 @@ _REPORT_THROTTLE = 0.1         # report() API 호출 간 최소 간격(초) — 
 
 _report_lock = threading.Lock()
 _last_report_ts = 0.0
-_QUOTA = threading.Event()  # 한도 초과 시 set → 제출된 잔여 작업을 API 호출 없이 즉시 단락
+_QUOTA = threading.Event()     # 한도 초과 시 set → 잔여 작업을 API 호출 없이 즉시 단락
 
 
 def _throttle_report() -> None:
@@ -85,12 +86,15 @@ def _throttle_report() -> None:
 
 
 # ---------------------------------------------------------------------------
-# document.xml ZIP → (사업보고서 본문, 감사보고서, 연결감사보고서) 평문
+# document.xml ZIP → (사업보고서, 감사보고서, 연결감사보고서) RAW 마크업
 # ---------------------------------------------------------------------------
 
 
 def _split_zip_reports(z) -> tuple[str, str, str]:
-    """ZIP 멤버를 DOCUMENT-NAME 으로 분류 → (biz_flat, audit_flat, consol_flat)."""
+    """ZIP 멤버를 DOCUMENT-NAME 으로 분류 → (사업보고서, 감사보고서, 연결감사보고서) RAW.
+
+    평문화·HTML 슬라이스는 호출부에서 수행한다 (HTML 본문 컬럼용 마크업 보존).
+    """
     biz = audit = consol = ""
     for name in z.namelist():
         try:
@@ -100,13 +104,13 @@ def _split_zip_reports(z) -> tuple[str, str, str]:
         m = _DOC_NAME.search(txt)
         title = (m.group(1).strip() if m else "")
         if "사업보고서" in title and not biz:
-            biz = html_to_text(txt)
+            biz = txt
         elif "감사보고서" in title:
             if ("연결" in title or "결합" in title):
                 if not consol:
-                    consol = html_to_text(txt)
+                    consol = txt
             elif not audit:
-                audit = html_to_text(txt)
+                audit = txt
     return biz, audit, consol
 
 
@@ -115,12 +119,14 @@ def _split_zip_reports(z) -> tuple[str, str, str]:
 # ---------------------------------------------------------------------------
 
 
-def _body_fields(flat: str) -> dict[str, str]:
-    """감사보고서 평문 → 본문/KAM본문/CPA/기타사항."""
+def _body_fields(raw: str) -> dict[str, str]:
+    """감사보고서 RAW 마크업 → 본문(평문)·HTML본문·KAM본문·CPA·기타사항."""
+    flat = html_to_text(raw) if raw else ""
     body = extract_standalone_audit_report_body(flat) or ""
     work = body or flat
     return {
         "audit_report_body": body,
+        "audit_report_body_html": (extract_audit_body_html(raw) or "") if raw else "",
         "kam_body_full": extract_kam_full_block(work) or "",
         "cpa_partner_name": extract_cpa_partner(work) or "",
         "other_matters": extract_other_matters(work) or "",
@@ -128,22 +134,18 @@ def _body_fields(flat: str) -> dict[str, str]:
 
 
 def _make_row(
-    stock: dict[str, str], op: AuditOpinion, report_kind: str, flat: str, ic: str
+    stock: dict[str, str], op: AuditOpinion, report_kind: str, raw: str, ic: str
 ) -> dict[str, Any]:
-    """매핑 메타 + report() 구조화 + 본문 추출 → v4 행 dict (영문 key + ic_summary)."""
-    bf = (
-        _body_fields(flat)
-        if flat
-        else {"audit_report_body": "", "kam_body_full": "", "cpa_partner_name": "", "other_matters": ""}
-    )
+    """매핑 메타 + report() 구조화 + document.xml 마크업 추출 → v4 행 dict."""
+    bf = _body_fields(raw)
     return {
         "stock_code": stock.get("stock_code", ""),
         "corp_code": op.corp_code or stock.get("corp_code", ""),
         "corp_name": op.corp_name or stock.get("corp_name", ""),
         "market": stock.get("market", ""),
         "report_kind": report_kind,
-        "attach_title": "",                       # viewer 전용 — API 불가
-        "parent_rcept_no": "",                    # viewer 전용 — API 불가
+        "attach_title": "",                       # API 경로 — 첨부 메타 없음
+        "parent_rcept_no": "",
         "biz_report_rcept_no": op.rcept_no,
         "stlm_dt": op.stlm_dt,
         "bsns_year": op.bsns_year,
@@ -155,24 +157,50 @@ def _make_row(
         "emphs_matter": op.emphs_matter,
         "other_matters": bf["other_matters"],
         "audit_report_body": bf["audit_report_body"],
-        "audit_report_body_html": "",             # viewer 렌더 전용 — API 불가
+        "audit_report_body_html": bf["audit_report_body_html"],
         "ic_summary": ic,
     }
 
 
 # ---------------------------------------------------------------------------
-# 회사 1건 처리 (report API + document.xml API)
+# viewer 폴백 — document.xml 에 감사보고서가 없을 때 (parse_one 재사용)
 # ---------------------------------------------------------------------------
 
 
-def _process_company(
-    api_key: str, dart: OpenDartReader, stock: dict[str, str], year: int
-) -> list[dict[str, Any]] | None:
-    """반환: 행 리스트(데이터 있음) 또는 ``None``(해당 연도 데이터 없음).
+def _viewer_fallback(
+    dart: OpenDartReader, settings: Settings, stock: dict[str, str],
+    year: int, start: str, end: str, ic: str,
+) -> list[dict[str, Any]]:
+    """attach_docs+viewer.do 로 본문 수집(검증된 parse_one 재사용) → v4 키 사상 + 내부통제 주입."""
+    rows = parse_one(
+        dart, settings, stock,
+        bsns_year=str(year), reprt_code=_REPRT_CODE,
+        start=start, end=end, fetch_body=True, save_raw_dir=settings.raw_dir,
+    )
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        v = {key: r.get(key, "") for key, _ in _V4_COLUMNS}
+        v["ic_summary"] = ic
+        out.append(v)
+    return out
 
-    한도 초과로 ``_QUOTA`` 가 set 되면 API 호출 없이 즉시 RuntimeError — 캐시도
-    남기지 않아 재실행 시 이어받는다.
-    """
+
+# ---------------------------------------------------------------------------
+# 회사 1건 처리 (API 우선 + viewer 폴백)
+# ---------------------------------------------------------------------------
+
+
+def _tag(rows: list[dict[str, Any]], via: str) -> list[dict[str, Any]]:
+    for r in rows:
+        r["_via"] = via  # 통계용 — _rows_to_df 가 v4 키만 골라 쓰므로 출력엔 안 들어감
+    return rows
+
+
+def _process_company(
+    api_key: str, dart: OpenDartReader, settings: Settings,
+    stock: dict[str, str], year: int, start: str, end: str,
+) -> list[dict[str, Any]] | None:
+    """반환: 행 리스트(데이터 있음) 또는 None(해당 연도 데이터 없음). 한도초과 시 RuntimeError."""
     if _QUOTA.is_set():
         raise RuntimeError("quota reached — skipped")
     _throttle_report()
@@ -182,22 +210,28 @@ def _process_company(
     if op is None:
         return None
 
-    biz = audit = consol = ""
+    biz_raw = audit_raw = consol_raw = ""
     if op.rcept_no:
-        z = fetch_document_zip(api_key, op.rcept_no)  # 한도초과 시 RuntimeError → 상위 중단
+        z = fetch_document_zip(api_key, op.rcept_no)  # 한도초과 시 RuntimeError
         if z is not None:
-            biz, audit, consol = _split_zip_reports(z)
+            biz_raw, audit_raw, consol_raw = _split_zip_reports(z)
 
-    ic = (extract_internal_control_summary(biz) or "") if biz else ""
+    ic = (extract_internal_control_summary(html_to_text(biz_raw)) or "") if biz_raw else ""
 
-    rows: list[dict[str, Any]] = []
-    if audit:
-        rows.append(_make_row(stock, op, "감사보고서", audit, ic))
-    if consol:
-        rows.append(_make_row(stock, op, "연결감사보고서", consol, ic))
-    if not rows:  # 본문 없음 — 구조화+내부통제만 1행
-        rows.append(_make_row(stock, op, "감사보고서", "", ic))
-    return rows
+    api_rows: list[dict[str, Any]] = []
+    if audit_raw:
+        api_rows.append(_make_row(stock, op, "감사보고서", audit_raw, ic))
+    if consol_raw:
+        api_rows.append(_make_row(stock, op, "연결감사보고서", consol_raw, ic))
+    if any(r["audit_report_body"] for r in api_rows):
+        return _tag(api_rows, "api")
+
+    # 본문 미확보 → viewer 폴백 (웹 조회)
+    vrows = _viewer_fallback(dart, settings, stock, year, start, end, ic)
+    if any(r.get("audit_report_body") for r in vrows):
+        return _tag(vrows, "viewer")
+
+    return _tag(api_rows or [_make_row(stock, op, "감사보고서", "", ic)], "none")
 
 
 # ---------------------------------------------------------------------------
@@ -233,12 +267,15 @@ def _cache_save(cache_dir: Path, year: int, corp_code: str, payload: dict) -> No
 def _run_batch(
     api_key: str,
     dart: OpenDartReader,
+    settings: Settings,
     mapping: list[dict[str, str]],
     year: int,
+    start: str,
+    end: str,
     cache_dir: Path,
     workers: int,
 ) -> list[dict[str, Any]]:
-    """매핑 회사들을 처리해 v4 행 리스트(영문 key) 반환. 캐시 우선·한도초과 시 중단."""
+    """매핑 회사들을 처리해 v4 행 리스트(영문 key) 반환. 캐시 우선·한도초과 시 단락."""
     cache_dir.mkdir(parents=True, exist_ok=True)
     _QUOTA.clear()
     all_rows: list[dict[str, Any]] = []
@@ -254,18 +291,18 @@ def _run_batch(
 
     total = len(todo)
     t0 = time.time()
-    done = with_body = no_data = no_doc = 0
+    done = with_body = no_body = no_data = via_viewer = 0
     quota_hit = False
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        fut_to_stock = {
-            pool.submit(_process_company, api_key, dart, s, year): s for s in todo
+        fut = {
+            pool.submit(_process_company, api_key, dart, settings, s, year, start, end): s
+            for s in todo
         }
-        for fut in as_completed(fut_to_stock):
-            stock = fut_to_stock[fut]
-            cc = stock["corp_code"]
+        for f in as_completed(fut):
+            cc = fut[f]["corp_code"]
             try:
-                rows = fut.result()
+                rows = f.result()
             except RuntimeError as e:  # 사용한도 초과 — 잔여 작업 단락 후 이월
                 _QUOTA.set()
                 if not quota_hit:
@@ -276,7 +313,7 @@ def _run_batch(
                 print(f"  err {cc}: {e}", flush=True)
                 continue
 
-            if rows is None:  # 해당 연도 데이터 없음 (상장 전 등)
+            if rows is None:
                 _cache_save(cache_dir, year, cc, {"rows": []})
                 no_data += 1
             else:
@@ -285,7 +322,9 @@ def _run_batch(
                 if any(r.get("audit_report_body") for r in rows):
                     with_body += 1
                 else:
-                    no_doc += 1
+                    no_body += 1
+                if rows and rows[0].get("_via") == "viewer":
+                    via_viewer += 1
 
             done += 1
             if done % _PROGRESS_EVERY == 0 or done == total:
@@ -293,8 +332,8 @@ def _run_batch(
                 rate = elapsed / done
                 eta = rate * (total - done)
                 print(
-                    f"  [{year} {done}/{total}] 본문={with_body} 본문없음={no_doc} "
-                    f"데이터없음={no_data} · 누적행={len(all_rows)} · "
+                    f"  [{year} {done}/{total}] 본문={with_body}(viewer폴백 {via_viewer}) "
+                    f"본문없음={no_body} 데이터없음={no_data} · 누적행={len(all_rows)} · "
                     f"{rate:.2f}s/co · ETA {eta/60:.1f}min",
                     flush=True,
                 )
@@ -328,18 +367,22 @@ def main(argv: list[str] | None = None) -> int:
     settings.require_key()
     dst = args.dst or (settings.data_dir / f"audit_reports_y{args.year}.xlsx")
     cache_dir = settings.data_dir / "year_api"
+    # 감사보고서제출 공시는 사업연도+1 의 1~6월에 제출 (viewer 폴백 list.json 기간)
+    start = f"{args.year + 1}-01-01"
+    end = f"{args.year + 1}-06-30"
 
     mapping = load_mapping(settings)
     if args.limit is not None:
         mapping = mapping[: args.limit]
     print(
         f"year={args.year} · 회사 {len(mapping)} · workers={args.workers} · "
-        f"cache={cache_dir} · dst={dst}",
+        f"viewer기간 {start}~{end} · cache={cache_dir} · dst={dst}",
         flush=True,
     )
 
     dart = OpenDartReader(settings.api_key)
-    rows = _run_batch(settings.api_key, dart, mapping, args.year, cache_dir, args.workers)
+    rows = _run_batch(settings.api_key, dart, settings, mapping, args.year,
+                      start, end, cache_dir, args.workers)
     if not rows:
         print("수집된 행이 없습니다.", file=sys.stderr)
         return 1
@@ -353,7 +396,8 @@ def main(argv: list[str] | None = None) -> int:
     os.replace(tmp, dst)
     print(f"\nwrote: {dst} ({dst.stat().st_size/1024/1024:.2f} MB, {len(df)}행)", flush=True)
 
-    for col in ("감사의견", "감사보고서 본문 전체", "핵심감사사항(본문)", _COL_IC_SUMMARY):
+    for col in ("감사의견", "감사보고서 본문 전체", "감사보고서 본문(HTML)",
+                "핵심감사사항(본문)", _COL_IC_SUMMARY):
         n = int((df[col].astype(str).str.strip() != "").sum())
         print(f"  {col}: {n}/{len(df)} ({100*n/max(len(df),1):.1f}%)", flush=True)
     return 0
