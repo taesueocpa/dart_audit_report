@@ -27,6 +27,17 @@ def render_sidebar(df: pd.DataFrame) -> tuple[pd.Series, dict]:
     """사이드바 위젯 렌더 + (mask, 선택값 dict) 반환."""
     st.sidebar.title("🔎 필터")
 
+    # 결산연도(사업연도) — 결산기준일(YYYY-MM-DD)의 연도. 빈 선택 = 전체. 최상단 배치.
+    fy_series = df["결산기준일"].fillna("").astype(str).str[:4]
+    fy_all = sorted({y for y in fy_series if y.isdigit()}, reverse=True)
+    fiscal_years = st.sidebar.multiselect(
+        "결산연도(사업연도)",
+        fy_all,
+        default=[],
+        placeholder="전체" + (f" ({fy_all[-1]}~{fy_all[0]})" if fy_all else ""),
+        help="결산기준일 기준 사업연도. 비우면 전체 연도.",
+    )
+
     market = st.sidebar.multiselect(
         "시장구분", _opts(df["시장구분"]), default=_opts(df["시장구분"])
     )
@@ -58,6 +69,8 @@ def render_sidebar(df: pd.DataFrame) -> tuple[pd.Series, dict]:
         mask &= df["감사의견"].isin(opinion)
     if kind:
         mask &= df["보고서 종류"].isin(kind)
+    if fiscal_years:
+        mask &= fy_series.isin(fiscal_years)
     if firms:
         mask &= df["감사인(회계법인)"].isin(firms)
     if name_q:
@@ -78,6 +91,7 @@ def render_sidebar(df: pd.DataFrame) -> tuple[pd.Series, dict]:
         "market": market,
         "opinion": opinion,
         "kind": kind,
+        "fiscal_years": fiscal_years,
         "firms": firms,
         "name_q": name_q,
         "body_kw": body_kw,

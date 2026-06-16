@@ -29,6 +29,7 @@ except ImportError:  # pragma: no cover
     tqdm = None  # type: ignore[assignment]
 
 from audit_xlsx.extractors import (
+    extract_audit_body_html,
     extract_cpa_partner,
     extract_kam_full_block,
     extract_other_matters,
@@ -89,9 +90,14 @@ def _meta_row(
         "report_kind": "",
         "attach_title": "",
         "parent_rcept_no": "",
+        "dcm_no": "",
         "cpa_partner_name": "",
         "other_matters": "",
         "audit_report_body": "",
+        "audit_report_body_html": "",
+        # KAM 분리 키 — kam_api 는 OPENDART 원천, kam_body_full 은 본문 ▶ API.
+        "kam_api": op.core_adt_matter if op else "",
+        "kam_body_full": op.core_adt_matter if op else "",
         "raw_text_length": 0,
         "flat_text_length": 0,
         "audit_report_body_length": 0,
@@ -125,10 +131,16 @@ def _build_row(
         "report_kind": att.report_kind,
         "attach_title": att.title,
         "parent_rcept_no": parent_rcept_no,
+        "dcm_no": att.dcm_no,
         "core_adt_matter": kam_final,  # _base_row 의 값을 본문 우선으로 덮어씀
         "cpa_partner_name": cpa,
         "other_matters": other,
         "audit_report_body": body or "",
+        "audit_report_body_html": extract_audit_body_html(raw_text) or "",
+        # KAM 분리 키 — v4 스키마용: kam_api 는 OPENDART 원천 그대로,
+        # kam_body_full 은 본문 추출 ▶ API fallback (core_adt_matter 와 동일 규칙).
+        "kam_api": op.core_adt_matter,
+        "kam_body_full": kam_final,
         "raw_text_length": len(raw_text),
         "flat_text_length": len(flat_text),
         "audit_report_body_length": len(body or ""),

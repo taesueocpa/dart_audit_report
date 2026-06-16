@@ -1,11 +1,16 @@
 # DART 감사보고서 대시보드
 
-OPENDART(전자공시) 에서 **코스피·코스닥 상장사 2025 사업연도 감사보고서**를 자동
+OPENDART(전자공시) 에서 **코스피·코스닥 상장사 2023~2025 사업연도 감사보고서**를 자동
 수집·파싱하여 **검색 가능한 XLSX DB** 와 **Streamlit 대시보드** 로 제공하는 프로젝트.
+
+> 2025 사업연도는 viewer 캐시 기반(`audit_xlsx`)으로, 2024·2023 과거연도는 **공식
+> `document.xml` API 전용**(`fetch_year_api`, viewer 스크래핑 없음)으로 수집한다.
 
 - 🌐 라이브 대시보드: [dart-audit-report.streamlit.app](https://share.streamlit.io/) (배포 후)
 - 📦 GitHub: <https://github.com/taesueocpa/dart_audit_report>
-- 🗂 메인 산출물: `dashboard/data/audit_reports_full_v3.xlsx` (15 MB, **4,627 행 × 24 컬럼**)
+- 🗂 메인 산출물: `dashboard/data/audit_reports_full_v4.xlsx`
+  (v3 감사보고서 본문 + **「내부통제에 관한 사항」 컬럼** — 내부회계관리제도
+  운영실태 평가 결론·중요한 취약점·시정조치·감사인 의견 요약, 99.6% 충족)
 
 ---
 
@@ -53,6 +58,9 @@ dart_audit_report/
 │   │   ├── parse_audit.py                 # 회사당 N행 생성 (병렬화 + dedupe)
 │   │   └── export_xlsx.py                 # dict → XLSX (Arial 폰트)
 │   ├── reparse_from_cache.py              # API 0회 — 캐시만 재파싱 (1~2분)
+│   ├── fetch_iacm_api.py                  # 공식 document.xml API → 내부통제에 관한 사항 (~10분)
+│   ├── fetch_year_api.py                  # 과거연도 API 전용 수집 (구조화+본문+내부통제, viewer 미사용)
+│   ├── merge_years.py                     # 연도별 XLSX → v4 병합 (concat+dedup+정렬)
 │   └── pyproject.toml                     # opendartreader/openpyxl/pandas
 │
 ├── dashboard/                              ← Streamlit 웹 대시보드
@@ -309,7 +317,40 @@ python ingest/reparse_from_cache.py
 # 결과: dashboard/data/audit_reports_full_v3.xlsx
 ```
 
-### 6-4. 대시보드 실행
+### 6-4. 내부회계관리제도 수집 → v4
+
+```powershell
+# 공식 document.xml API (~10분, 차단 없음) — 사업보고서 본문에서
+# 「내부통제에 관한 사항」(경영진 평가 결론·중요한 취약점·시정조치계획·
+# 감사인 의견 요약표) 추출, v4 에 병합 (캐시: data/iacm_api/*.json)
+python -m ingest.fetch_iacm_api
+```
+
+> 참고: 제8조제4~6항 원형 3절(운영실태보고서/감사 평가보고서/감사인 보고서
+> 전문)은 사업보고서 첨부 「내부회계관리제도운영보고서」에만 있고 공식 API
+> document.xml ZIP 에는 미포함이라 수집하지 않는다. 특히 감사 평가보고서
+> (제8조제5항)는 DART viewer 스크래핑으로만 접근 가능했으나, anti-bot 취약성·
+> 유지비용 때문에 해당 경로(`fetch_iacm.py`)를 제거했다(2026-06). 내부통제
+> 추출 원본은 `data/iacm_api/*.json` 캐시에 보존.
+
+### 6-5. 과거연도(2024·2023) 수집 → v4 (API 전용)
+
+```powershell
+# 공식 document.xml API 만 사용 (viewer 스크래핑 없음). 매 50개사 진행상황 출력.
+# 회사별 (report API 구조화 4필드) + (document.xml: 감사/연결 본문·KAM본문·CPA·
+# 기타·내부통제) 추출 → data/audit_reports_y{YYYY}.xlsx (캐시: data/year_api/*.json)
+python -m ingest.fetch_year_api --year 2024
+python -m ingest.fetch_year_api --year 2023
+
+# 연도별 파일을 v4 에 병합 (concat → (회사,결산일,종류) 중복제거 → 정렬)
+python -m ingest.merge_years --years 2024 2023
+```
+
+> API 한계: 과거연도는 `감사보고서 본문(HTML)` 서식보존본·`첨부 제목`이 비고(평문
+> 본문만), document.xml ZIP 에 감사보고서 XML 이 없는 일부 회사는 구조화+내부통제만
+> 채워진다. 한도(일 20,000) 초과 시 graceful 중단 → 재실행하면 캐시로 이어받는다.
+
+### 6-6. 대시보드 실행
 
 ```powershell
 cd dashboard

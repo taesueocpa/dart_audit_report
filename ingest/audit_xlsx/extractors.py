@@ -297,3 +297,42 @@ def extract_other_matters(text: str) -> str | None:
     end = _section_end(text, header.end(), _OTHER_STOPS)
     body = re.sub(r"\s+", " ", text[header.end() : end]).strip()
     return body[:_OTHER_OUT_LIMIT] if len(body) >= _OTHER_MIN_LEN else None
+
+
+# ---------------------------------------------------------------------------
+# 6) 공식 document.xml API 기반 「내부통제에 관한 사항」
+# ---------------------------------------------------------------------------
+#
+# OPENDART 공시서류원본파일(document.xml) ZIP 의 *사업보고서 본문* XML 에는
+# 「내부통제에 관한 사항」 절이 있다 — 경영진의 내부회계관리제도 효과성 평가
+# 결과(평가 결론·중요한 취약점·시정조치계획)와 감사인의 감사(검토)의견 요약표.
+#
+# 같은 문구가 목차에도 등장하므로, 표제 직후 점선/대시 런이 보이면 목차 항목으로
+# 보고 건너뛴다. 끝 마커는 다음 로마숫자 대제목.
+
+_IC_SUMMARY_HEAD = re.compile(r"내부통제에\s*관한\s*사항")
+# 끝 마커: 다음 대제목 — ASCII (IV.) 와 유니코드 로마숫자 (Ⅵ.) 모두.
+_IC_SUMMARY_END = re.compile(r"^\s*(?:[IVX]+|[Ⅰ-Ⅻ])\s*\.\s*\S", re.MULTILINE)
+# 목차(TOC) 잔해 감지 — 표제 직후 점선/대시 런 (예: "내부통제에 관한 사항 ---- 287").
+_TOC_DASH_RUN = re.compile(r"[-.…·]{4,}")
+_IC_SUMMARY_OUT_LIMIT = 50_000
+_IC_SUMMARY_MIN_LEN = 100
+
+
+def extract_internal_control_summary(flat: str) -> str | None:
+    """사업보고서 본문 평문에서 「내부통제에 관한 사항」 절.
+
+    경영진의 내부회계관리제도 효과성 평가 결과·감사인의 감사(검토)의견 요약
+    표가 들어 있다. 같은 문구가 목차에도 등장하므로 표제 직후 80자 내에
+    점선/대시 런이 보이면 목차 항목으로 보고 다음 매치로 넘어간다.
+    끝 마커는 다음 로마숫자 대제목.
+    """
+    for m in _IC_SUMMARY_HEAD.finditer(flat):
+        if _TOC_DASH_RUN.search(flat[m.end(): m.end() + 80]):
+            continue  # 목차 항목
+        m2 = _IC_SUMMARY_END.search(flat, m.end())
+        end = m2.start() if m2 else min(len(flat), m.end() + 20_000)
+        out = flat[m.start():end].strip()
+        if len(out) >= _IC_SUMMARY_MIN_LEN:
+            return out[:_IC_SUMMARY_OUT_LIMIT]
+    return None

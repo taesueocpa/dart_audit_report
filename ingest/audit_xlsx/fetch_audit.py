@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import html
 import re
+import threading
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -32,14 +34,49 @@ from audit_xlsx.extractors import collapse_hangul_spaces
 # ---------------------------------------------------------------------------
 # HTTP 상수
 # ---------------------------------------------------------------------------
+#
+# 첨부 목록(attach_docs)/뷰어(viewer.do) 는 OPENDART *API* 가 아니라 공시뷰어
+# 웹사이트(dart.fss.or.kr)를 스크래핑한다. 이 사이트는 짧은 시간에 동시·연타
+# 요청이 들어오면 anti-bot 으로 연결을 강제로 끊는다 (ConnectionReset). API
+# 분당 1,000회 한도와 무관하므로, 정상 브라우저처럼 단일 흐름 + 요청 간 최소
+# 간격 + 세션 재사용으로 "예의 바르게" 긁어야 차단을 피한다.
 
-_USER_AGENT = "Mozilla/5.0"
+_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 _LIST_URL = "https://opendart.fss.or.kr/api/list.json"
 _VIEWER_BASE = "http://dart.fss.or.kr/report/viewer.do"
 _DEFAULT_TIMEOUT = 60.0
 _MAIN_DO_TIMEOUT = 30.0
 _LIST_PAGE_COUNT = 100
 _LIST_TIMEOUT = 30
+
+# 연결 차단(throttle) 시 백오프 재시도. attach_docs 의 "첨부 없음" 예외는
+# 재시도하지 않고 즉시 포기 (연결오류만 재시도).
+_HTTP_RETRIES = 4
+_HTTP_BACKOFF_SEC = 4.0
+_ATTACH_RETRIES = 3
+_ATTACH_BACKOFF_SEC = 6.0
+
+# dart.fss.or.kr 요청 사이 최소 간격(초) — 모든 워커가 공유하는 전역 rate limit.
+_MIN_REQUEST_INTERVAL = 0.4
+
+_SESSION = requests.Session()
+_SESSION.headers.update({"User-Agent": _USER_AGENT})
+
+_THROTTLE_LOCK = threading.Lock()
+_last_request_ts = 0.0
+
+
+def _throttle() -> None:
+    """dart.fss.or.kr 요청 전 전역 최소 간격을 강제 (anti-bot 회피)."""
+    global _last_request_ts
+    with _THROTTLE_LOCK:
+        wait = _MIN_REQUEST_INTERVAL - (time.monotonic() - _last_request_ts)
+        if wait > 0:
+            time.sleep(wait)
+        _last_request_ts = time.monotonic()
 
 # ---------------------------------------------------------------------------
 # HTML → 평문 변환
@@ -301,14 +338,31 @@ _MULTI_PAGE = re.compile(
 _EXCLUDE_ATTACH_TITLE = re.compile(r"감사위원회|감사의\s*감사")
 
 
+def _attach_docs_with_retry(dart: OpenDartReader, parent_rcept_no: str, match: str):
+    """``dart.attach_docs`` 호출 — 연결오류(throttle)만 백오프 재시도.
+
+    attach_docs 는 dart.fss.or.kr 스크래핑이라, 연결차단 시 ``RequestException``
+    을 던진다(→ 재시도). 반면 첨부가 실제로 없으면 일반 ``Exception``("첨부문서
+    를 포함하고 있지 않습니다")을 던지므로 재시도하지 않고 즉시 ``None``.
+    """
+    for attempt in range(_ATTACH_RETRIES):
+        _throttle()
+        try:
+            return dart.attach_docs(parent_rcept_no, match=match)
+        except requests.RequestException:  # 연결차단 = 일시 throttle → 재시도
+            if attempt == _ATTACH_RETRIES - 1:
+                return None
+            time.sleep(_ATTACH_BACKOFF_SEC * (attempt + 1))
+        except Exception:  # noqa: BLE001 — 첨부 없음 등 = 즉시 포기
+            return None
+    return None
+
+
 def list_audit_attachments(
     dart: OpenDartReader, parent_rcept_no: str
 ) -> list[Attachment]:
     """공시의 첨부 중 외부감사보고서 (감사/연결감사/결합감사) 만."""
-    try:
-        df = dart.attach_docs(parent_rcept_no, match="감사보고서")
-    except Exception:  # noqa: BLE001
-        return []
+    df = _attach_docs_with_retry(dart, parent_rcept_no, "감사보고서")
     if df is None or df.empty:
         return []
     out: list[Attachment] = []
@@ -342,12 +396,21 @@ def _viewer_url(rcp: str, dcm: str, ele: str, off: str, length: str, dtd: str) -
 
 
 def _http_get(url: str, *, timeout: float = _DEFAULT_TIMEOUT) -> str:
-    """raw text GET. 실패 시 빈 문자열."""
-    try:
-        r = requests.get(url, headers={"User-Agent": _USER_AGENT}, timeout=timeout)
-        return r.text
-    except requests.RequestException:
-        return ""
+    """raw text GET (세션 재사용 + 전역 rate limit).
+
+    throttle(ConnectionReset)/타임아웃 시 백오프 재시도. 모든 재시도 소진 후
+    에도 실패하면 빈 문자열.
+    """
+    for attempt in range(_HTTP_RETRIES):
+        _throttle()
+        try:
+            r = _SESSION.get(url, timeout=timeout)
+            return r.text
+        except requests.RequestException:
+            if attempt == _HTTP_RETRIES - 1:
+                return ""
+            time.sleep(_HTTP_BACKOFF_SEC * (attempt + 1))
+    return ""
 
 
 def fetch_attachment_body(main_url: str) -> str:
